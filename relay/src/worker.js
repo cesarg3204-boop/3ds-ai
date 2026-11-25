@@ -6,11 +6,14 @@
 //
 // Setup (Cloudflare dashboard): Workers AI binding named AI. Optional variable MODEL.
 
+// Smartest first; if one fails (or isn't on your account) the next is tried.
 const MODELS = [
+  "@cf/openai/gpt-oss-120b",
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   "@cf/meta/llama-3.1-8b-instruct-fast",
-  "@cf/meta/llama-3.1-8b-instruct",
 ];
+// Small, quick model that only decides what to search for.
+const PLANNER = "@cf/meta/llama-3.1-8b-instruct-fast";
 
 const UA = "Mozilla/5.0 (compatible; SpikeAI-Relay/1.0)";
 
@@ -80,24 +83,102 @@ async function getText(url) {
   return res.text();
 }
 
-const SHOPS = /(amazon|walmart|target|ebay|bestbuy|kroger|costco)\./i;
+const SKIP = /(amazon|walmart|target|ebay|bestbuy|kroger|costco|youtube|tiktok|instagram|facebook|pinterest)\./i;
 
-export async function webLookup(q) {
-  const query = q.replace(/\s+/g, " ").trim().slice(0, 120);
+async function search(query) {
   const enc = encodeURIComponent(query);
   const [news, web] = await Promise.all([
     getText(`https://www.bing.com/news/search?q=${enc}&format=rss&setlang=en-US`).then(parseRss).catch(() => []),
-    getText(`https://www.bing.com/search?q=${enc}&format=rss&setlang=en-US`).then(parseRss).catch(() => []),
+    getText(`https://www.bing.com/search?q=${enc}&format=rss&setlang=en-US&count=10`).then(parseRss).catch(() => []),
   ]);
   const out = [], seen = new Set();
-  // Mix: news first (fresh), then web pages; skip shop pages.
-  for (const r of [...news.slice(0, 4), ...web]) {
-    if (out.length >= 6) break;
-    if (seen.has(r.link) || SHOPS.test(r.link)) continue;
+  // Real web pages first (they answer questions), then a couple of news items.
+  for (const r of [...web.slice(0, 6), ...news.slice(0, 3), ...web.slice(6)]) {
+    if (out.length >= 7) break;
+    if (seen.has(r.link) || SKIP.test(r.link)) continue;
     seen.add(r.link);
     out.push(r);
   }
   return out;
+}
+
+function words(q) {
+  return [...new Set(String(q).toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2))];
+}
+
+// The readable text of a page, keeping the parts that match the query.
+export function pageText(html, query, max = 2500) {
+  const body = String(html)
+    .replace(/<(script|style|noscript|svg|nav|footer|header|form|iframe)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(br|\/p|\/div|\/li|\/h\d|\/tr|\/td|\/th|\/section|\/article)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+  const lines = decodeEntities(body).split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter((l) => l.length > 2 && l.length < 600);
+  const keys = words(query);
+  const scored = lines.map((l, i) => {
+    const low = l.toLowerCase();
+    let sc = 0;
+    for (const k of keys) if (low.includes(k)) sc += 2;
+    if (/\d/.test(l)) sc += 1;
+    if (l.length > 60) sc += 1;
+    return { l, i, sc };
+  });
+  const pick = [...scored].sort((a, b) => b.sc - a.sc || a.i - b.i);
+  const keep = new Set();
+  let len = 0;
+  for (const p of pick) {
+    if (p.sc <= 0 || len > max) break;
+    // keep the neighbors too: numbers often sit on the next line (e.g. "Protein" / "21g")
+    for (const j of [p.i - 1, p.i, p.i + 1]) {
+      if (j < 0 || j >= lines.length || keep.has(j)) continue;
+      keep.add(j);
+      len += lines[j].length + 1;
+    }
+  }
+  return [...keep].sort((a, b) => a - b).map((j) => lines[j]).join("\n").slice(0, max);
+}
+
+async function fetchPage(url, query) {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36", "Accept-Language": "en-US,en;q=0.9,es;q=0.8" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok || !/html/.test(res.headers.get("content-type") || "")) return "";
+  const html = (await res.text()).slice(0, 600000);
+  return pageText(html, query);
+}
+
+// Searches, then reads the top pages so Spike answers from real sites, not snippets.
+export async function webLookup(query) {
+  const results = await search(query);
+  await Promise.all(results.slice(0, 4).map(async (r) => {
+    r.page = await fetchPage(r.link, query).catch(() => "");
+  }));
+  return results;
+}
+
+// Decides whether the latest message needs a web search and writes the query,
+// using the conversation so follow-ups ("and the macros?") keep their topic.
+export async function planSearch(env, history, force) {
+  const convo = history.slice(-8).map((m) => `${m.role === "user" ? "User" : "Spike"}: ${m.content.slice(0, 600)}`).join("\n");
+  const prompt = [
+    { role: "system", content: "You write web search queries for an assistant. Read the conversation and look at the LAST user message. " +
+      "If answering it needs facts from the web (any specific product, brand, food, nutrition facts, game, person, place, price, score, release, news, statistic, or anything that could be outdated or that you are not 100% sure about), reply with exactly: SEARCH: <query>. " +
+      "The query must stand on its own: include the topic from earlier messages (for example 'Quest chips macros nutrition facts', not 'macros'). Never 'correct' names you don't recognize; search them exactly as written. " +
+      "Only if it's pure chit-chat, opinion, math, or writing help, reply exactly: NONE." },
+    { role: "user", content: convo },
+  ];
+  let q = "";
+  try {
+    const r = await env.AI.run(PLANNER, { messages: prompt, max_tokens: 40, temperature: 0 });
+    const t = answerText(r).trim();
+    const m = t.match(/SEARCH:\s*(.+)/i);
+    if (m) q = m[1].replace(/^["']|["']$/g, "").trim();
+    else if (/^none/i.test(t) && !force) return "";
+  } catch {}
+  if (!q && (force || !env.AI)) q = history[history.length - 1].content;
+  return q.replace(/\s+/g, " ").slice(0, 150);
 }
 
 // ---------- the AI ----------
@@ -108,16 +189,19 @@ export function systemPrompt(req, results, today) {
     "You are Spike, a friendly AI assistant that lives on a Nintendo 3DS. Your mascot is a little blue sprout.",
     `Today is ${today}.`,
     "Always reply in the same language the user writes in (English or Spanish).",
+    "Follow the whole conversation: follow-up questions are about what you were just talking about. If the user corrects you, accept it and use the correction from then on.",
+    "Never assume the user made a typo or meant a different product, game or person. If you don't recognize a name, use the web results; if those don't cover it, say you're not sure instead of guessing.",
+    "Never make up numbers (nutrition facts, prices, stats, dates). Only give numbers that appear in the web results or that you are certain of.",
     "The screen is small: use plain text only. No markdown, no tables, no headings, no asterisks. Short paragraphs; simple dashes for lists.",
     `Personality: ${persona}`,
   ];
   if (req.project.trim()) parts.push(`About this project (keep this in mind in every answer): ${req.project.trim()}`);
   if (results) {
     if (results.length) {
-      parts.push("Web results found just now for the user's latest message:\n" +
-        results.map((r, i) => `[${i + 1}] ${r.title}${r.date ? ` (${r.date})` : ""}\n${r.text}`).join("\n\n") +
-        "\nUse them for current facts and cite them like [1].");
-    } else parts.push("A web search was attempted but found nothing; answer from what you know and say it may be out of date.");
+      parts.push(`Web results found just now (searched: "${results.query || ""}"):\n\n` +
+        results.map((r, i) => `[${i + 1}] ${r.title}${r.date ? ` (${r.date})` : ""}\n${r.link}\n${r.page ? `Page text:\n${r.page}` : r.text}`).join("\n\n") +
+        "\n\nAnswer from these results first and cite them like [1]. Prefer the official site or the most reliable source when they disagree.");
+    } else parts.push("A web search was attempted but found nothing; answer from what you know and say clearly that you couldn't check it online.");
   }
   return parts.join("\n\n");
 }
@@ -130,13 +214,30 @@ export function plain(s) {
     .replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// Pulls the text out of the different answer shapes Workers AI models use.
+export function answerText(r) {
+  if (!r) return "";
+  if (typeof r === "string") return r;
+  if (typeof r.response === "string") return r.response;
+  if (r.response && typeof r.response === "object") return answerText(r.response);
+  if (r.result) return answerText(r.result);
+  const c = r.choices && r.choices[0];
+  if (c) return (c.message && c.message.content) || c.text || "";
+  if (Array.isArray(r.output)) {
+    return r.output.filter((o) => o.type === "message")
+      .flatMap((o) => o.content || []).map((p) => p.text || "").join("");
+  }
+  if (typeof r.output_text === "string") return r.output_text;
+  return "";
+}
+
 async function runAI(env, messages) {
   const models = env.MODEL ? [env.MODEL, ...MODELS] : MODELS;
   let last;
   for (const m of models) {
     try {
-      const r = await env.AI.run(m, { messages, max_tokens: 900, temperature: 0.6 });
-      const text = typeof r === "string" ? r : r && (r.response ?? r.result?.response);
+      const r = await env.AI.run(m, { messages, max_tokens: m.includes("gpt-oss") ? 3000 : 1000, temperature: 0.4 });
+      const text = answerText(r);
       if (text && String(text).trim()) return String(text);
       last = new Error("empty answer");
     } catch (e) { last = e; }
@@ -148,8 +249,15 @@ export async function chat(body, env, today) {
   const req = parseRequest(body);
   const history = req.messages.slice(-16);
   if (!history.length || history[history.length - 1].role !== "user") return "ERR\tNothing to answer.\n";
-  const wantWeb = req.web || req.persona === "searcher";
-  const results = wantWeb ? await webLookup(history[history.length - 1].content).catch(() => []) : null;
+  const force = req.persona === "searcher";
+  let results = null;
+  if (req.web || force) {
+    const q = await planSearch(env, history, force);
+    if (q) {
+      results = await webLookup(q).catch(() => []);
+      results.query = q;
+    }
+  }
   const messages = [{ role: "system", content: systemPrompt(req, results, today) }, ...history];
   const answer = plain(await runAI(env, messages));
   const lines = ["OK", `A\t${esc(answer)}`];

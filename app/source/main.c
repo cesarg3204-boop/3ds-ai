@@ -249,6 +249,7 @@ static void cfg_load(void)
 	memset(&cfg, 0, sizeof cfg);
 	cfg.persona = 1;
 	cfg.verify = true;
+	cfg.web = true;
 	char *d = read_file(BASE "/config.txt");
 	if (d) { each_line(d, cfg_line, NULL); free(d); }
 	if (cfg.persona < 0 || cfg.persona >= NPERSONA) cfg.persona = 1;
@@ -1219,7 +1220,7 @@ static void draw_top(void)
 			snprintf(tmp, sizeof tmp, "Used when the personality is Custom.\n\n%s", cfg.custom[0] ? cfg.custom : "Example: Answer like a pirate and keep it under 3 sentences.");
 			body = tmp;
 			break;
-		case S_WEB: body = "When on, Spike searches the web before answering, for news, prices, scores and anything recent. Answers take a few seconds longer. The Searcher personality always does this."; break;
+		case S_WEB: body = "When on, Spike decides when to search the web and reads the actual sites before answering (products, nutrition, games, news, prices). Answers take a few seconds longer. The Searcher personality always searches."; break;
 		case S_VERIFY: body = "Checks the relay's security certificate. Leave it on. Turn it off only if the 3DS clock is wrong and you get certificate errors."; break;
 		case S_TEST: body = ping_status[0] ? ping_status : "Press A to check that Spike can reach your relay."; break;
 		}
