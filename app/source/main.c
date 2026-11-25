@@ -925,8 +925,10 @@ static void draw_chat_bottom(void)
 	Project *p = proj_find(cur.project);
 	char sub[64] = "";
 	if (p) snprintf(sub, sizeof sub, "%s", p->name);
-	draw_bottom_header(cur.n ? cur.title : "New chat", NULL);
-	if (p) text_draw_fit(sub, 10, 20, 0.36f, T.sub, 200);
+	rect(0, 0, BOT_W, 30, T.bar);
+	rect(0, 30, BOT_W, 1, T.line);
+	text_draw_fit(cur.n ? cur.title : "New chat", 10, p ? 1 : 5, p ? 0.5f : 0.55f, T.text, 214);
+	if (p) text_draw_fit(sub, 10, 17, 0.36f, T.sub, 214);
 	button(232, 3, 82, 24, "Settings", NULL, A_SETTINGS, 0);
 
 	if (thinking) button(12, 42, 296, 58, "Spike is thinking...", NULL, A_NONE, 2);
