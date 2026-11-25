@@ -393,25 +393,28 @@ export async function chat(body, env, today) {
 // model and shows which ones your key can use for free.
 async function geminiCheck(env) {
   if (!env.GEMINI_KEY) return "No GEMINI_KEY on this relay.\n";
-  const out = [];
+  const lines = ["Gemini models for your key:", ""];
   let names = [];
   try {
-    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": env.GEMINI_KEY } });
-    const j = await r.json();
-    if (!r.ok) return `Listing models failed: ${r.status} ${j.error?.message || ""}\n`;
-    names = (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace("models/", ""))
-      .filter((n) => /flash|pro/.test(n) && !/image|tts|audio|live|embed|preview-0/.test(n));
-  } catch (e) { return `Listing models failed: ${e.message}\n`; }
-  const want = [...new Set([...(env.GEMINI_MODEL ? [env.GEMINI_MODEL] : []), ...GEMINI_MODELS, ...names])].slice(0, 25);
-  await Promise.all(want.map(async (m, i) => {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
-      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Say ok" }] }], generationConfig: { maxOutputTokens: 5 } }),
-    }).catch((e) => ({ ok: false, status: 0, json: async () => ({ error: { message: e.message } }) }));
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100", { headers: { "x-goog-api-key": env.GEMINI_KEY } });
     const j = await r.json().catch(() => ({}));
-    out[i] = `${r.ok ? "WORKS " : "no    "} ${m}${r.ok ? "" : `  (${r.status} ${(j.error?.message || "").slice(0, 80)})`}`;
-  }));
-  return "Gemini models for your key:\n\n" + out.join("\n") + "\n\nAvailable on this key: " + names.join(", ") + "\n";
+    if (!r.ok) lines.push(`(listing models failed: ${r.status} ${j.error?.message || ""})`);
+    names = (j.models || []).map((m) => String(m.name || "").replace("models/", ""))
+      .filter((n) => /^gemini-[\d.]+-(flash|pro)(-lite)?$|latest$/.test(n));
+  } catch (e) { lines.push(`(listing models failed: ${e.message})`); }
+  const want = [...new Set([...(env.GEMINI_MODEL ? [env.GEMINI_MODEL] : []), ...GEMINI_MODELS, ...names])].slice(0, 12);
+  for (const m of want) {
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Say ok" }] }], generationConfig: { maxOutputTokens: 5 } }),
+      });
+      const j = await r.json().catch(() => ({}));
+      lines.push(r.ok ? `WORKS  ${m}` : `no     ${m}  (${r.status} ${String(j.error?.message || "").slice(0, 70)})`);
+    } catch (e) { lines.push(`no     ${m}  (${e.message})`); }
+  }
+  lines.push("", "Models on this key: " + (names.join(", ") || "?"));
+  return lines.join("\n") + "\n";
 }
 
 // ---------- entry ----------
@@ -426,7 +429,9 @@ export default {
     if (url.pathname === "/" || url.pathname === "/v1/ping") {
       return text(`SPIKE OK\t${env.AI || env.GEMINI_KEY ? "ai" : "no-ai"}\t${env.GEMINI_KEY ? "gemini" : "cloudflare"}\n`);
     }
-    if (url.pathname === "/v1/gemini-check") return text(await geminiCheck(env));
+    if (url.pathname === "/v1/gemini-check") {
+      try { return text(await geminiCheck(env)); } catch (e) { return text(`Check failed: ${e.message}\n`); }
+    }
     const body = request.method === "POST" ? await request.text() : "";
     if (!env.AI && !env.GEMINI_KEY) return text("ERR\tNo AI set up yet: add the Workers AI binding named AI, or a GEMINI_KEY secret.\n");
     try {
