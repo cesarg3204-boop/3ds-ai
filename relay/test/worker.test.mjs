@@ -56,18 +56,9 @@ await test("falls back to another model", async () => {
   assert.equal(tried.length, 2);
 });
 
-await test("password and ping", async () => {
-  const env = { SPIKE_KEY: "pw", AI: { run: async () => ({ response: "yo" }) } };
-  let r = await worker.fetch(new Request("https://x/v1/chat", { method: "POST", body: "U\thi" }), env);
-  assert.equal(r.status, 401);
-  r = await worker.fetch(new Request("https://x/v1/chat", { method: "POST", body: "U\thi", headers: { "X-Spike-Key": "pw" } }), env);
-  assert.equal(await r.text(), "OK\nA\tyo\n");
-  r = await worker.fetch(new Request("https://x/v1/chat", { method: "POST", body: "U\thi", headers: { "X-Spike-Key": " PW " } }), env);
-  assert.equal(r.status, 200, "case and spaces ignored");
-  r = await worker.fetch(new Request("https://x/v1/chat", { method: "POST", body: "K\tPw\nU\thi" }), env);
-  assert.equal(r.status, 200, "key in body works");
-  r = await worker.fetch(new Request("https://x/v1/ping", { headers: { "X-Spike-Key": "nope" } }), env);
-  assert.equal(await r.text(), "SPIKE OK\tai\tkey-wrong\n");
+await test("ping", async () => {
+  const r = await worker.fetch(new Request("https://x/v1/ping"), { AI: {} });
+  assert.equal(await r.text(), "SPIKE OK\tai\n");
 });
 
 console.log(`${passed} tests passed`);

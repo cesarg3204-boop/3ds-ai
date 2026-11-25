@@ -557,12 +557,11 @@ static void add_kv(Str *s, const char *k, const char *v)
 static void send_chat(void)
 {
 	if (!cfg.relay[0]) {
-		copy(chat_err, sizeof chat_err, "Spike needs a relay first. Press SELECT, open Settings and add your relay address and password.");
+		copy(chat_err, sizeof chat_err, "Spike needs a relay first. Open Settings and add your relay address.");
 		return;
 	}
 	Str s = {0};
 	int p = persona_for(cur.project);
-	add_kv(&s, "K", cfg.key);
 	add_kv(&s, "P", P_ID[p]);
 	if (p == 5) add_kv(&s, "C", cfg.custom);
 	Project *pr = proj_find(cur.project);
@@ -577,7 +576,6 @@ static void send_chat(void)
 	j->post = s.d;
 	j->timeout = 100;
 	j->arg = cur.id;
-	snprintf(j->header, sizeof j->header, "X-Spike-Key: %s", cfg.key);
 	net_submit(j, true);
 	thinking = true;
 	thinking_chat = cur.id;
@@ -592,7 +590,6 @@ static void send_ping(void)
 	relay_url(url, sizeof url, "/v1/ping");
 	Job *j = job_new(JOB_TEXT, TAG_PING, url);
 	j->timeout = 20;
-	snprintf(j->header, sizeof j->header, "X-Spike-Key: %s", cfg.key);
 	net_submit(j, true);
 	copy(ping_status, sizeof ping_status, "Testing...");
 }
@@ -959,7 +956,7 @@ typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET } RowKind;
 typedef struct { RowKind kind; int ref; char title[80]; char sub[96]; } Row;
 static Row rows[MAX_CHATS + 8];
 
-enum { S_RELAY, S_KEY, S_PERSONA, S_CUSTOM, S_WEB, S_VERIFY, S_TEST, S_COUNT };
+enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_VERIFY, S_TEST, S_COUNT };
 enum { PS_NAME, PS_PERSONA, PS_INSTR, PS_DELETE, PS_COUNT };
 
 static void date_str(long long t, char *out, size_t n)
@@ -1018,7 +1015,6 @@ static int build_rows(View v)
 			r->sub[0] = 0;
 			switch (i) {
 			case S_RELAY: copy(r->title, sizeof r->title, "Relay address"); copy(r->sub, sizeof r->sub, cfg.relay[0] ? cfg.relay : "Not set"); break;
-			case S_KEY: copy(r->title, sizeof r->title, "Password"); copy(r->sub, sizeof r->sub, cfg.key[0] ? cfg.key : "Not set"); break;
 			case S_PERSONA: copy(r->title, sizeof r->title, "Personality"); copy(r->sub, sizeof r->sub, P_NAME[cfg.persona]); break;
 			case S_CUSTOM: copy(r->title, sizeof r->title, "Custom instructions"); copy(r->sub, sizeof r->sub, cfg.custom[0] ? cfg.custom : "Empty"); break;
 			case S_WEB: copy(r->title, sizeof r->title, "Look things up online"); yesno(cfg.web, r->sub, sizeof r->sub); break;
@@ -1215,7 +1211,6 @@ static void draw_top(void)
 		char tmp[1400];
 		switch (r->ref) {
 		case S_RELAY: body = "The address of your Spike relay on Cloudflare, like spike-ai.yourname.workers.dev"; break;
-		case S_KEY: body = "The same password you saved as SPIKE_KEY on Cloudflare."; break;
 		case S_PERSONA:
 			snprintf(tmp, sizeof tmp, "%s: %s\n\nUsed in every chat, except projects that have their own personality. Press Left/Right to change it.", P_NAME[cfg.persona], P_DESC[cfg.persona]);
 			body = tmp;
@@ -1361,10 +1356,6 @@ static void setting_change(int s, int dir)
 	case S_RELAY:
 		if (dir) return;
 		if (kb("Relay address (spike-ai.you.workers.dev)", cfg.relay, 190, false, false, "Save")) { copy(cfg.relay, sizeof cfg.relay, kbuf); ping_status[0] = 0; }
-		break;
-	case S_KEY:
-		if (dir) return;
-		if (kb("Password (SPIKE_KEY)", cfg.key, 90, false, false, "Save")) { copy(cfg.key, sizeof cfg.key, kbuf); ping_status[0] = 0; }
 		break;
 	case S_PERSONA: cycle_persona(&cfg.persona, dir ? dir : 1, false); break;
 	case S_CUSTOM:
