@@ -925,7 +925,9 @@ static void draw_chat_bottom(void)
 	Project *p = proj_find(cur.project);
 	char sub[64] = "";
 	if (p) snprintf(sub, sizeof sub, "%s", p->name);
-	draw_bottom_header(cur.n ? cur.title : "New chat", p ? sub : NULL);
+	draw_bottom_header(cur.n ? cur.title : "New chat", NULL);
+	if (p) text_draw_fit(sub, 10, 20, 0.36f, T.sub, 200);
+	button(232, 3, 82, 24, "Settings", NULL, A_SETTINGS, 0);
 
 	if (thinking) button(12, 42, 296, 58, "Spike is thinking...", NULL, A_NONE, 2);
 	else if (chat_err[0]) {
@@ -1438,8 +1440,10 @@ static void do_action(int a)
 	if (a >= A_ROW) {
 		int i = a - A_ROW;
 		if (view == V_CHAT) return;
-		if (sel[view] == i) activate_row(view, i);
-		else { sel[view] = i; if (armed_view == view) armed = -1; }
+		// one tap opens/changes the row, like a phone
+		if (sel[view] != i && armed_view == view) armed = -1;
+		sel[view] = i;
+		activate_row(view, i);
 		return;
 	}
 	switch (a) {
