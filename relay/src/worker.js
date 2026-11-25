@@ -164,19 +164,31 @@ function text(body, status = 200) {
   return new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
+// Passwords are compared without caring about capitals or stray spaces
+// (phone and 3DS keyboards like to add both).
+const norm = (s) => String(s || "").trim().toLowerCase();
+
+function bodyKey(body) {
+  const m = String(body).match(/^K\t(.*)$/m);
+  return m ? unesc(m[1]) : "";
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const want = norm(env.SPIKE_KEY);
     if (url.pathname === "/" || url.pathname === "/v1/ping") {
-      const keyOk = !env.SPIKE_KEY || request.headers.get("X-Spike-Key") === env.SPIKE_KEY;
+      const keyOk = !want || norm(request.headers.get("X-Spike-Key")) === want;
       return text(`SPIKE OK\t${env.AI ? "ai" : "no-ai"}\t${keyOk ? "key-ok" : "key-wrong"}\n`);
     }
-    if (env.SPIKE_KEY && request.headers.get("X-Spike-Key") !== env.SPIKE_KEY) return text("ERR\tWrong password. Check it in Spike's Settings.\n", 401);
+    const body = request.method === "POST" ? await request.text() : "";
+    if (want && norm(request.headers.get("X-Spike-Key")) !== want && norm(bodyKey(body)) !== want)
+      return text("ERR\tWrong password. Check it in Spike's Settings (capitals don't matter).\n", 401);
     if (!env.AI) return text("ERR\tWorkers AI isn't turned on for this relay yet (binding named AI).\n");
     try {
       if (url.pathname === "/v1/chat" && request.method === "POST") {
         const today = new Date().toISOString().slice(0, 10);
-        return text(await chat(await request.text(), env, today));
+        return text(await chat(body, env, today));
       }
       return text("ERR\tUnknown request\n", 404);
     } catch (e) {

@@ -254,8 +254,19 @@ static void cfg_load(void)
 	if (cfg.persona < 0 || cfg.persona >= NPERSONA) cfg.persona = 1;
 }
 
+static void trim(char *t)
+{
+	char *a = t;
+	while (*a == ' ' || *a == '\n' || *a == '\t') a++;
+	memmove(t, a, strlen(a) + 1);
+	size_t k = strlen(t);
+	while (k && (t[k - 1] == ' ' || t[k - 1] == '\n' || t[k - 1] == '\t')) t[--k] = 0;
+}
+
 static void cfg_save(void)
 {
+	trim(cfg.key);
+	trim(cfg.relay);
 	FILE *f = fopen(BASE "/config.txt", "wb");
 	if (!f) return;
 	char *a = esc(cfg.relay), *b = esc(cfg.key), *c = esc(cfg.custom);
@@ -551,6 +562,7 @@ static void send_chat(void)
 	}
 	Str s = {0};
 	int p = persona_for(cur.project);
+	add_kv(&s, "K", cfg.key);
 	add_kv(&s, "P", P_ID[p]);
 	if (p == 5) add_kv(&s, "C", cfg.custom);
 	Project *pr = proj_find(cur.project);
@@ -1002,7 +1014,7 @@ static int build_rows(View v)
 			r->sub[0] = 0;
 			switch (i) {
 			case S_RELAY: copy(r->title, sizeof r->title, "Relay address"); copy(r->sub, sizeof r->sub, cfg.relay[0] ? cfg.relay : "Not set"); break;
-			case S_KEY: copy(r->title, sizeof r->title, "Password"); copy(r->sub, sizeof r->sub, cfg.key[0] ? "********" : "Not set"); break;
+			case S_KEY: copy(r->title, sizeof r->title, "Password"); copy(r->sub, sizeof r->sub, cfg.key[0] ? cfg.key : "Not set"); break;
 			case S_PERSONA: copy(r->title, sizeof r->title, "Personality"); copy(r->sub, sizeof r->sub, P_NAME[cfg.persona]); break;
 			case S_CUSTOM: copy(r->title, sizeof r->title, "Custom instructions"); copy(r->sub, sizeof r->sub, cfg.custom[0] ? cfg.custom : "Empty"); break;
 			case S_WEB: copy(r->title, sizeof r->title, "Look things up online"); yesno(cfg.web, r->sub, sizeof r->sub); break;
