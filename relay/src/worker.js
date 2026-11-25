@@ -269,7 +269,7 @@ async function runAI(env, messages) {
 
 // ---------- Gemini (smarter, with Google Search built in) ----------
 
-const GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.0-flash"];
+const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"];
 
 export async function gemini(req, history, env, today, doFetch = fetch) {
   const search = req.web || req.persona === "searcher";
@@ -286,7 +286,7 @@ export async function gemini(req, history, env, today, doFetch = fetch) {
   };
   if (search) body.tools = [{ google_search: {} }];
   const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
-  let last;
+  const errs = [];
   for (const m of models) {
     try {
       const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
@@ -295,10 +295,14 @@ export async function gemini(req, history, env, today, doFetch = fetch) {
         body: JSON.stringify(body),
       });
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) { last = new Error(`Gemini ${res.status}: ${j.error?.message || ""}`.slice(0, 160)); if (res.status === 400 || res.status === 403) break; continue; }
+      if (!res.ok) {
+        errs.push(`${m}: ${res.status} ${(j.error?.message || "").slice(0, 90)}`);
+        if (res.status === 403 || (res.status === 400 && /api key/i.test(j.error?.message || ""))) break;
+        continue;
+      }
       const c = j.candidates && j.candidates[0];
       const text = (c?.content?.parts || []).map((p) => p.text || "").join("");
-      if (!text.trim()) { last = new Error("Gemini gave an empty answer"); continue; }
+      if (!text.trim()) { errs.push(`${m}: empty answer (${c?.finishReason || "?"})`); continue; }
       const seen = new Set(), sources = [];
       for (const g of c.groundingMetadata?.groundingChunks || []) {
         const w = g.web;
@@ -308,9 +312,10 @@ export async function gemini(req, history, env, today, doFetch = fetch) {
         if (sources.length >= 6) break;
       }
       return { text, sources };
-    } catch (e) { last = e; }
+    } catch (e) { errs.push(`${m}: ${e.message}`); }
   }
-  throw last || new Error("Gemini didn't answer");
+  // the first error is usually the telling one (later models are just fallbacks)
+  throw new Error(`Gemini didn't answer. ${errs.slice(0, 2).join(" | ")}`.slice(0, 230));
 }
 
 // ---------- voice ----------
