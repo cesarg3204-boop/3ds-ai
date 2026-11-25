@@ -112,4 +112,31 @@ await test("gemini tries the next model when one is busy", async () => {
   assert.equal(tried.length, 2);
 });
 
+await test("photo, file and voice lines attach to the user message", () => {
+  const r = parseRequest("U\twhat is this\nG\timage/png\tAAAA\nX\tnotes.txt\tline1\\nline2\nU\t\nV\tUklGRg==");
+  assert.equal(r.messages[0].images[0].mime, "image/png");
+  assert.match(r.messages[0].content, /Attached file "notes.txt"\]\nline1\nline2/);
+  assert.equal(r.messages[1].voice, "UklGRg==");
+});
+
+await test("voice is transcribed and sent back", async () => {
+  const env = { AI: { run: async (m, o) => m.includes("whisper") ? { text: " hola spike " } : { response: "¡Hola!" } } };
+  const out = await chat("U\t\nV\tUklGRg==", env, "d");
+  assert.equal(out, "OK\nT\thola spike\nA\t¡Hola!\n");
+});
+
+await test("photos without gemini say so", async () => {
+  const env = { AI: { run: async () => ({ response: "x" }) } };
+  assert.match(await chat("U\t\nG\timage/png\tAAAA", env, "d"), /^ERR\tPhotos need Gemini/);
+});
+
+await test("gemini gets the photo", async () => {
+  let sent;
+  const fakeFetch = async (u, o) => { sent = JSON.parse(o.body); return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "A cat" }] } }] })); };
+  const req = parseRequest("U\t\nG\timage/jpeg\tQUJD");
+  req.messages[0].content = "(photo)";
+  await gemini(req, req.messages, { GEMINI_KEY: "k" }, "d", fakeFetch);
+  assert.deepEqual(sent.contents[0].parts[0], { inline_data: { mime_type: "image/jpeg", data: "QUJD" } });
+});
+
 console.log(`${passed} tests passed`);

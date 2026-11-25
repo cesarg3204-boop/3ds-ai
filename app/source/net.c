@@ -187,7 +187,7 @@ static inline u32 morton(int x, int y, int tw)
 }
 
 // Scales (cover-crop, nearest) the decoded image into a w*h box and tiles it.
-static bool decode_image(Job *j, const unsigned char *data, size_t len)
+bool image_decode(Job *j, const unsigned char *data, size_t len)
 {
 	int sw, sh, comp;
 	unsigned char *px = stbi_load_from_memory(data, (int)len, &sw, &sh, &comp, 4);
@@ -233,7 +233,7 @@ static void run_job(Job *j)
 		j->len = b.len;
 		j->ok = true;
 	} else {
-		j->ok = b.data && decode_image(j, (unsigned char *)b.data, b.len);
+		j->ok = b.data && image_decode(j, (unsigned char *)b.data, b.len);
 		free(b.data);
 	}
 }

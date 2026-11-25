@@ -42,5 +42,8 @@ void net_drop_low(void);      // forget queued (not started) low-priority jobs
 bool net_busy(void);
 void net_set_verify(bool on);
 
+// Decodes a JPG/PNG into j->pixels, cover-cropped to j->w x j->h (0 = natural size).
+bool image_decode(Job *j, const unsigned char *data, size_t len);
+
 // URL-encodes s into a new malloc'd string.
 char *net_escape(const char *s);

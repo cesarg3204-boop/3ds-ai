@@ -12,11 +12,21 @@
 #include <time.h>
 #include "gfx.h"
 #include "net.h"
+#include "media.h"
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#define STBI_NO_LINEAR
+#define STBI_NO_HDR
+#include "stb_image.h"
+#include <dirent.h>
+#include <strings.h>
 
 #define BASE "sdmc:/3ds/SpikeAI"
 #define MAX_CHATS 300
 #define MAX_PROJECTS 40
 #define HISTORY 16
+#define VOICE_PH "(voice message)"
 
 // ---------------------------------------------------------------- personas
 
@@ -157,6 +167,9 @@ typedef struct {
 	char role;   // 'U' or 'A'
 	char *text;
 	char *src;   // "title\n" per source (assistant only), may be NULL
+	char att;    // attachment on a user message: 'P' picture, 'F' text file, 0 none
+	char *att_path;
+	bool thumb_fail;
 	// layout cache
 	char **ln;
 	int nln;
@@ -191,6 +204,7 @@ static void conv_clear(Conv *c)
 		msg_layout_free(&c->m[i]);
 		free(c->m[i].text);
 		free(c->m[i].src);
+		free(c->m[i].att_path);
 	}
 	free(c->m);
 	memset(c, 0, sizeof *c);
@@ -226,6 +240,7 @@ static void ensure_dirs(void)
 	mkdir("sdmc:/3ds", 0777);
 	mkdir(BASE, 0777);
 	mkdir(BASE "/chats", 0777);
+	mkdir(BASE "/att", 0777);
 }
 
 static void cfg_line(char *ln, void *ud)
@@ -361,6 +376,11 @@ static void conv_line(char *ln, void *ud)
 	Conv *c = ud;
 	char *v = cut(ln);
 	if (!strcmp(ln, "U") || !strcmp(ln, "A")) conv_add(c, ln[0], unesc(v));
+	else if (!strcmp(ln, "F") && c->n && c->m[c->n - 1].role == 'U') {
+		char *path = cut(v);
+		c->m[c->n - 1].att = v[0];
+		c->m[c->n - 1].att_path = strdup(unesc(path));
+	}
 	else if (!strcmp(ln, "S") && c->n && c->m[c->n - 1].role == 'A') {
 		cut(v); // drop the url
 		src_add(&c->m[c->n - 1], unesc(v));
@@ -392,6 +412,11 @@ static void conv_save(Conv *c)
 		char *t = esc(c->m[i].text);
 		fprintf(f, "%c\t%s\n", c->m[i].role, t);
 		free(t);
+		if (c->m[i].att && c->m[i].att_path) {
+			char *e = esc(c->m[i].att_path);
+			fprintf(f, "F\t%c\t%s\n", c->m[i].att, e);
+			free(e);
+		}
 		if (c->m[i].src) {
 			char *s = strdup(c->m[i].src), *p = s;
 			while (*p) {
@@ -447,7 +472,10 @@ static void cur_commit(void)
 			nchats--;
 		}
 		cur.id = next_chat_id();
-		make_title(cur.m[0].text, cur.title, sizeof cur.title);
+		const char *first = cur.m[0].text;
+		if (!first[0] && cur.m[0].att == 'P') first = "Photo";
+		else if (!first[0] && cur.m[0].att_path) { const char *b = strrchr(cur.m[0].att_path, '/'); first = b ? b + 1 : cur.m[0].att_path; }
+		make_title(first, cur.title, sizeof cur.title);
 		ChatInfo *ci = &chats[nchats++];
 		ci->id = cur.id;
 		ci->project = cur.project;
@@ -507,10 +535,10 @@ static bool kb(const char *hint, const char *initial, int maxlen, bool multiline
 
 // ---------------------------------------------------------------- app state
 
-typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS } View;
+typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS, V_FILES, V_CAMERA, V_TALK } View;
 
 static View view = V_CHAT;
-static int sel[6], scrl[6];        // list selection / first visible row per view
+static int sel[10], scrl[10];        // list selection / first visible row per view
 static int open_project;           // project shown in V_PROJECT / V_PROJEDIT
 static float chat_scroll;          // pixels up from the bottom
 static bool thinking;
@@ -522,6 +550,19 @@ static int armed = -1;             // row waiting for a second Y to delete
 static View armed_view;
 static char ping_status[200];
 static float t_anim;
+// attachment waiting for the next message
+static char pend_att;
+static char pend_path[300];
+// last recording, kept until Spike understood it (for "try again")
+static char *voice_b64;
+static char voice_err[160];
+// file browser
+#define MAX_FILES 400
+typedef struct { char name[128]; bool dir; } FileEnt;
+static FileEnt files[MAX_FILES];
+static int nfiles;
+static char cwd[300] = "sdmc:/";
+static bool cam_inner;
 
 static void say(const char *msg)
 {
@@ -569,13 +610,44 @@ static void send_chat(void)
 	if (pr && pr->instr[0]) add_kv(&s, "I", pr->instr);
 	if (cfg.web) add_kv(&s, "W", "1");
 	int start = cur.n > HISTORY ? cur.n - HISTORY : 0;
-	for (int i = start; i < cur.n; i++) add_kv(&s, cur.m[i].role == 'U' ? "U" : "A", cur.m[i].text);
+	int last_pic = -1;
+	for (int i = start; i < cur.n; i++) if (cur.m[i].att == 'P') last_pic = i;
+	for (int i = start; i < cur.n; i++) {
+		Msg *m = &cur.m[i];
+		bool voice = m->role == 'U' && i == cur.n - 1 && voice_b64 && !strcmp(m->text, VOICE_PH);
+		add_kv(&s, m->role == 'U' ? "U" : "A", voice ? "" : m->text);
+		if (voice) { s_add(&s, "V\t"); s_add(&s, voice_b64); s_add(&s, "\n"); }
+		if (m->att == 'F' && m->att_path) {
+			size_t n = 0;
+			unsigned char *d = file_read(m->att_path, 200000, &n);
+			if (d) {
+				if (n > 16000) d[16000] = 0;
+				const char *b = strrchr(m->att_path, '/');
+				char *e = esc((char *)d), *nm = esc(b ? b + 1 : m->att_path);
+				s_add(&s, "X\t"); s_add(&s, nm); s_add(&s, "\t"); s_add(&s, e); s_add(&s, "\n");
+				free(e); free(nm); free(d);
+			}
+		}
+		if (m->att == 'P' && i == last_pic && m->att_path) {
+			const char *mime = NULL;
+			size_t n = 0;
+			char err[120];
+			unsigned char *d = picture_for_upload(m->att_path, &mime, &n, err, sizeof err);
+			if (!d) {
+				if (i == cur.n - 1) { copy(chat_err, sizeof chat_err, err); free(s.d); return; }
+				continue;
+			}
+			char *b = b64_encode(d, n);
+			free(d);
+			if (b) { s_add(&s, "G\t"); s_add(&s, mime); s_add(&s, "\t"); s_add(&s, b); s_add(&s, "\n"); free(b); }
+		}
+	}
 
 	char url[260];
 	relay_url(url, sizeof url, "/v1/chat");
 	Job *j = job_new(JOB_TEXT, TAG_CHAT, url);
 	j->post = s.d;
-	j->timeout = 100;
+	j->timeout = 150;
 	j->arg = cur.id;
 	net_submit(j, true);
 	thinking = true;
@@ -602,7 +674,7 @@ static void got_chat(Job *j)
 	// a chat that was saved while waiting (the first message) has a new id
 	if (id == 0 && thinking_chat == 0) id = cur.id;
 	char err[240] = "";
-	char *answer = NULL;
+	char *answer = NULL, *heard = NULL;
 	Str srcs = {0};
 	if (!j->ok) snprintf(err, sizeof err, "Couldn't reach the relay: %s", j->err);
 	else if (!strncmp(j->body, "ERR\t", 4)) {
@@ -616,6 +688,7 @@ static void got_chat(Job *j)
 			char *nl = strchr(p, '\n');
 			if (nl) *nl = 0;
 			if (!strncmp(p, "A\t", 2)) answer = unesc(p + 2);
+			else if (!strncmp(p, "T\t", 2)) heard = unesc(p + 2);
 			else if (!strncmp(p, "S\t", 2)) {
 				char *t = p + 2;
 				cut(t);
@@ -637,6 +710,25 @@ static void got_chat(Job *j)
 	Conv tmp = {0}, *c = here ? &cur : &tmp;
 	if (!here) conv_load(&tmp, id);
 	if (!here && !tmp.id) { free(srcs.d); return; } // chat was deleted
+	if (heard && *heard) {
+		// show what Spike heard instead of "(voice message)"
+		for (int i = c->n - 1; i >= 0; i--) {
+			if (c->m[i].role != 'U') continue;
+			if (!strcmp(c->m[i].text, VOICE_PH)) {
+				free(c->m[i].text);
+				c->m[i].text = strdup(heard);
+				msg_layout_free(&c->m[i]);
+				ChatInfo *ci = chat_find(id);
+				if (ci && !strcmp(ci->title, VOICE_PH)) {
+					make_title(heard, ci->title, sizeof ci->title);
+					if (here) copy(cur.title, sizeof cur.title, ci->title);
+				}
+			}
+			break;
+		}
+		free(voice_b64);
+		voice_b64 = NULL;
+	}
 	Msg *m = conv_add(c, 'A', answer);
 	if (srcs.d) { m->src = srcs.d; }
 	if (here) { cur_commit(); chat_scroll = 0; }
@@ -710,16 +802,57 @@ static bool blinking(void)
 #define SPIKE_X 34
 #define SPIKE_MAXW (TOP_W - SPIKE_X - 10)
 
+#define THUMB_W 160
+#define THUMB_H 120
+
+static const char *att_label(Msg *m)
+{
+	static char b[160];
+	const char *n = m->att_path ? strrchr(m->att_path, '/') : NULL;
+	snprintf(b, sizeof b, "[File] %s", n ? n + 1 : "file");
+	return b;
+}
+
+static u32 path_key(const char *s)
+{
+	u32 h = 2166136261u;
+	for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+	return h | 1;
+}
+
+// A small picture of a file, cover-cropped to w x h (cached).
+static Picture *thumb(const char *path, int w, int h, bool *failed)
+{
+	u32 key = path_key(path) ^ (u32)(w * 131 + h);
+	Picture *p = pic_find(key);
+	if (p || *failed) return p;
+	size_t n = 0;
+	unsigned char *d = file_read(path, 12 * 1024 * 1024, &n);
+	if (!d) { *failed = true; return NULL; }
+	Job j = {0};
+	j.w = w; j.h = h;
+	// image_decode can't shrink huge photos without running out of memory
+	int iw = 0, ih = 0, c;
+	if (stbi_info_from_memory(d, n, &iw, &ih, &c) && (long long)iw * ih <= 4400000 && image_decode(&j, d, n))
+		p = pic_add(key, j.pixels, j.tw, j.th, j.iw, j.ih);
+	else *failed = true;
+	free(j.pixels);
+	free(d);
+	return p;
+}
+
 static void msg_layout(Msg *m)
 {
 	if (m->h >= 0) return;
 	float lh = text_line_h(FS);
 	if (m->role == 'U') {
-		m->nln = text_wrap(m->text, FS, USER_MAXW - 20, &m->ln);
+		m->nln = m->text[0] ? text_wrap(m->text, FS, USER_MAXW - 20, &m->ln) : 0;
 		float w = 0;
 		for (int i = 0; i < m->nln; i++) { float x = text_width(m->ln[i], FS); if (x > w) w = x; }
-		m->bw = w + 20;
 		m->h = m->nln * lh + 12;
+		if (m->att == 'P') { m->h += THUMB_H + (m->nln ? 6 : 0); if (w < THUMB_W) w = THUMB_W; }
+		if (m->att == 'F') { m->h += lh; float fw = text_width(att_label(m), FS); if (fw > w) w = fw; if (w > USER_MAXW - 20) w = USER_MAXW - 20; }
+		m->bw = w + 20;
 	} else {
 		m->nln = text_wrap(m->text, FS, SPIKE_MAXW, &m->ln);
 		m->h = m->nln * lh + 4;
@@ -769,8 +902,20 @@ static void draw_msg(Msg *m, float y)
 	if (m->role == 'U') {
 		float x = TOP_W - 10 - m->bw;
 		rrect(x, y, m->bw, m->h, 10, T.card2);
+		float ty = y;
+		if (m->att == 'P') {
+			Picture *pic = m->att_path ? thumb(m->att_path, THUMB_W, THUMB_H, &m->thumb_fail) : NULL;
+			float px = x + m->bw - 10 - THUMB_W;
+			if (pic) pic_draw(pic, px, y + 6, THUMB_W, THUMB_H);
+			else { rrect(px, y + 6, THUMB_W, THUMB_H, 6, T.card); text_draw_center("Photo", px + THUMB_W / 2, y + 6 + THUMB_H / 2 - 8, 0.5f, T.sub); }
+			ty += THUMB_H + 6;
+		}
+		if (m->att == 'F') {
+			text_draw_fit(att_label(m), x + 10, y + 6, FS, T.accent, m->bw - 20);
+			ty += lh;
+		}
 		for (int i = 0; i < m->nln; i++) {
-			float ly = y + 6 + i * lh;
+			float ly = ty + 6 + i * lh;
 			if (ly > 240 || ly + lh < BAR_H) continue;
 			text_draw(m->ln[i], x + 10, ly, FS, T.text);
 		}
@@ -845,7 +990,7 @@ static void draw_conv(Conv *c, float *scroll, bool with_thinking, const char *er
 	if (neln) {
 		rrect(SPIKE_X - 6, y - 2, SPIKE_MAXW + 4, neln * text_line_h(0.45f) + 8, 6, rgba(90, 30, 34, 255));
 		for (int i = 0; i < neln; i++) text_draw(eln[i], SPIKE_X, y + 2 + i * text_line_h(0.45f), 0.45f, rgba(255, 190, 190, 255));
-		text_draw("Press R to try again", SPIKE_X, y + 10 + neln * text_line_h(0.45f), 0.42f, T.sub);
+		text_draw("Press A to try again", SPIKE_X, y + 10 + neln * text_line_h(0.45f), 0.42f, T.sub);
 		lines_free(eln, neln);
 	}
 	// scroll bar
@@ -864,6 +1009,7 @@ static void draw_conv(Conv *c, float *scroll, bool with_thinking, const char *er
 typedef enum {
 	A_NONE, A_TYPE, A_RETRY, A_CHATS, A_NEW, A_WEB, A_STYLE, A_SETTINGS, A_SOON,
 	A_BACK, A_TAB_CHATS, A_TAB_PROJECTS, A_OPEN, A_RENAME, A_DELETE, A_EDITPROJ,
+	A_TALK, A_PHOTO, A_ATTACH, A_UNATTACH, A_SNAP, A_FLIP, A_VOICE_SEND, A_CANCEL, A_UP,
 	A_ROW = 100,
 } Action;
 
@@ -930,13 +1076,24 @@ static void draw_chat_bottom(void)
 
 	if (thinking) button(12, 42, 296, 58, "Spike is thinking...", NULL, A_NONE, 2);
 	else if (chat_err[0]) {
-		button(12, 42, 144, 58, "Try again", "R", A_RETRY, 1);
-		button(164, 42, 144, 58, "Type", "A", A_TYPE, 0);
-	} else button(12, 42, 296, 58, "Type a message", "A", A_TYPE, 1);
+		button(12, 42, 144, 58, "Try again", "A", A_RETRY, 1);
+		button(164, 42, 144, 58, "Type", "touch", A_TYPE, 0);
+	} else if (pend_att) button(12, 42, 296, 58, pend_att == 'P' ? "Ask about the photo" : "Ask about the file", "A", A_TYPE, 1);
+	else button(12, 42, 296, 58, "Type a message", "A", A_TYPE, 1);
 
-	button(12, 110, 94, 44, "Talk", "soon", A_SOON, 2);
-	button(113, 110, 94, 44, "Photo", "soon", A_SOON, 2);
-	button(214, 110, 94, 44, "Attach", "soon", A_SOON, 2);
+	if (pend_att) {
+		const char *b = strrchr(pend_path, '/');
+		char lbl[96];
+		snprintf(lbl, sizeof lbl, "%s %s", pend_att == 'P' ? "Photo:" : "File:", b ? b + 1 : pend_path);
+		rrect(12, 110, 210, 44, 9, T.card);
+		text_draw_fit(lbl, 22, 123, 0.47f, T.accent, 190);
+		button(228, 110, 80, 44, "Remove", "B", A_UNATTACH, 0);
+	} else {
+		int st = thinking ? 2 : 0;
+		button(12, 110, 94, 44, "Talk", "R", A_TALK, st);
+		button(113, 110, 94, 44, "Photo", "Left", A_PHOTO, st);
+		button(214, 110, 94, 44, "Attach", "Right", A_ATTACH, st);
+	}
 
 	char web[24], style[32];
 	snprintf(web, sizeof web, "Web %s", cfg.web ? "on" : "off");
@@ -952,9 +1109,9 @@ static void draw_chat_bottom(void)
 
 // ---- lists
 
-typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET } RowKind;
+typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET, R_UP, R_DIR, R_FILE } RowKind;
 typedef struct { RowKind kind; int ref; char title[80]; char sub[96]; } Row;
-static Row rows[MAX_CHATS + 8];
+static Row rows[MAX_CHATS + MAX_FILES + 8];
 
 enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_VERIFY, S_TEST, S_COUNT };
 enum { PS_NAME, PS_PERSONA, PS_INSTR, PS_DELETE, PS_COUNT };
@@ -1022,6 +1179,20 @@ static int build_rows(View v)
 			case S_TEST: copy(r->title, sizeof r->title, "Test connection"); copy(r->sub, sizeof r->sub, ping_status[0] ? ping_status : "Checks the relay and password"); break;
 			}
 			for (char *q = r->sub; *q; q++) if (*q == '\n') *q = ' ';
+		}
+	} else if (v == V_FILES) {
+		if (strcmp(cwd, "sdmc:/")) {
+			Row *r = &rows[n++];
+			r->kind = R_UP; r->ref = -1;
+			copy(r->title, sizeof r->title, ".. (back up)");
+			r->sub[0] = 0;
+		}
+		for (int i = 0; i < nfiles; i++) {
+			Row *r = &rows[n++];
+			r->kind = files[i].dir ? R_DIR : R_FILE;
+			r->ref = i;
+			snprintf(r->title, sizeof r->title, "%s%s", files[i].name, files[i].dir ? "/" : "");
+			r->sub[0] = 0;
 		}
 	} else if (v == V_PROJEDIT) {
 		Project *p = proj_find(open_project);
@@ -1137,6 +1308,33 @@ static void draw_bottom(void)
 		draw_footer("A change   Left/Right personality   B back");
 		break;
 	}
+	case V_FILES: {
+		n = build_rows(V_FILES);
+		char t[120];
+		snprintf(t, sizeof t, "%s", strlen(cwd) > 6 ? cwd + 5 : "SD card");
+		draw_bottom_header(t, NULL);
+		if (n) draw_list(V_FILES, n);
+		else text_draw_center("No pictures or .txt files here", BOT_W / 2, 110, 0.47f, T.sub);
+		draw_footer("A open / pick   B back   (JPG, PNG, TXT)");
+		break;
+	}
+	case V_CAMERA:
+		draw_bottom_header("Photo", NULL);
+		button(12, 42, 296, 80, "Snap", "A", A_SNAP, 1);
+		button(12, 132, 144, 70, cam_inner ? "Back camera" : "Selfie camera", "X", A_FLIP, 0);
+		button(164, 132, 144, 70, "Cancel", "B", A_CANCEL, 0);
+		draw_footer("The top screen shows what the camera sees");
+		break;
+	case V_TALK: {
+		draw_bottom_header("Talk", NULL);
+		char t[64];
+		snprintf(t, sizeof t, "%.0f / %d s", mic_seconds(), MIC_MAX_SECONDS);
+		text_draw_center(t, BOT_W / 2, 44, 0.5f, T.sub);
+		button(12, 70, 296, 80, "Send", "A or R", A_VOICE_SEND, 1);
+		button(12, 158, 296, 46, "Cancel", "B", A_CANCEL, 0);
+		draw_footer("Talk in English or Spanish, then press Send");
+		break;
+	}
 	case V_SETTINGS:
 		n = build_rows(V_SETTINGS);
 		draw_bottom_header("Settings", "Spike AI 1.0");
@@ -1148,6 +1346,9 @@ static void draw_bottom(void)
 }
 
 // ---------------------------------------------------------------- drawing: top screen per view
+
+static bool is_pic(const char *n);
+static void file_path(int i, char *out, size_t n);
 
 static void draw_text_panel(const char *title, const char *body, const char *note)
 {
@@ -1167,7 +1368,7 @@ static void draw_top(void)
 	case V_CHAT: {
 		Project *p = proj_find(cur.project);
 		snprintf(right, sizeof right, "%s%s%s", p ? p->name : "", p ? "  |  " : "", P_NAME[persona_for(cur.project)]);
-		if (!cur.n && !thinking) draw_welcome(100, "Hi! I'm Spike.", "Press A to type. I speak English y español.");
+		if (!cur.n && !thinking) draw_welcome(100, "Hi! I'm Spike.", "A type, R talk, Left photo, Right attach. English y español.");
 		else draw_conv(&cur, &chat_scroll, thinking && thinking_chat == cur.id, chat_err);
 		draw_top_bar(cur.n ? cur.title : "Spike", right);
 		break;
@@ -1227,6 +1428,52 @@ static void draw_top(void)
 		draw_top_bar("Settings", NULL);
 		break;
 	}
+	case V_FILES: {
+		Row *r = build_rows(V_FILES) ? &rows[sel[V_FILES]] : NULL;
+		if (r && r->kind == R_FILE) {
+			char path[300];
+			file_path(r->ref, path, sizeof path);
+			if (is_pic(path)) {
+				static char last[300];
+				static bool failed;
+				if (strcmp(last, path)) { copy(last, sizeof last, path); failed = false; }
+				Picture *pic = thumb(path, 320, 200, &failed);
+				if (pic) pic_draw(pic, 40, 32, 320, 200);
+				else text_draw_center(failed ? "Can't preview this one (too big?)" : "Loading...", 200, 120, 0.5f, T.sub);
+			} else {
+				static char last[300], prev[1600];
+				if (strcmp(last, path)) {
+					copy(last, sizeof last, path);
+					size_t n = 0;
+					unsigned char *d = file_read(path, 300000, &n);
+					copy(prev, sizeof prev, d ? (char *)d : "(can't read this file)");
+					free(d);
+				}
+				draw_text_panel(files[r->ref].name, prev, "Press A to attach");
+			}
+		} else draw_text_panel("Attach a file", "Pick a JPG or PNG picture, or a .txt file, from your SD card. Spike can look at pictures and read text files. Your 3DS photos are in the DCIM folder.", NULL);
+		draw_top_bar("SD card", NULL);
+		break;
+	}
+	case V_CAMERA:
+		cam_draw(0, 0);
+		rrect(150, 214, 100, 20, 10, rgba(0, 0, 0, 140));
+		text_draw_center("A = snap", 200, 216, 0.45f, rgba(255, 255, 255, 255));
+		break;
+	case V_TALK: {
+		float lv = mic_level();
+		float pulse = 30 + lv * 40 + sinf(t_anim * 4) * 3;
+		fan(200, 104, pulse, pulse, 0, 6.2832f, rgba(74, 144, 255, 60));
+		fan(200, 104, pulse * 0.75f, pulse * 0.75f, 0, 6.2832f, rgba(74, 144, 255, 80));
+		sprout(200, 108, 24, blinking());
+		text_draw_center("I'm listening...", 200, 176, 0.62f, T.text);
+		for (int i = 0; i < 24; i++) {
+			float h = 4 + lv * 24 * (0.5f + 0.5f * sinf(t_anim * 9 + i * 0.9f));
+			rrect(110 + i * 8, 216 - h / 2, 4, h, 2, T.accent);
+		}
+		draw_top_bar("Talk to Spike", NULL);
+		break;
+	}
 	case V_PROJEDIT: {
 		Project *p = proj_find(open_project);
 		if (p) {
@@ -1243,6 +1490,131 @@ static void draw_top(void)
 // ---------------------------------------------------------------- actions
 
 static void go_chat(void) { view = V_CHAT; armed = -1; }
+
+static bool is_pic(const char *n)
+{
+	const char *e = strrchr(n, '.');
+	return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".png"));
+}
+
+static bool is_txt(const char *n)
+{
+	const char *e = strrchr(n, '.');
+	return e && (!strcasecmp(e, ".txt") || !strcasecmp(e, ".md") || !strcasecmp(e, ".csv"));
+}
+
+static int cmp_file(const void *a, const void *b)
+{
+	const FileEnt *x = a, *y = b;
+	if (x->dir != y->dir) return x->dir ? -1 : 1;
+	return strcasecmp(x->name, y->name);
+}
+
+static void load_dir(void)
+{
+	nfiles = 0;
+	DIR *d = opendir(cwd);
+	if (!d) { copy(cwd, sizeof cwd, "sdmc:/"); d = opendir(cwd); }
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d)) && nfiles < MAX_FILES) {
+		if (e->d_name[0] == '.') continue;
+		bool dir = e->d_type == DT_DIR;
+		if (!dir && !is_pic(e->d_name) && !is_txt(e->d_name)) continue;
+		copy(files[nfiles].name, sizeof files[nfiles].name, e->d_name);
+		files[nfiles].dir = dir;
+		nfiles++;
+	}
+	closedir(d);
+	qsort(files, nfiles, sizeof *files, cmp_file);
+	sel[V_FILES] = scrl[V_FILES] = 0;
+}
+
+static void file_path(int i, char *out, size_t n)
+{
+	size_t k = strlen(cwd);
+	snprintf(out, n, "%s%s%s", cwd, k && cwd[k - 1] == '/' ? "" : "/", files[i].name);
+}
+
+static void dir_up(void)
+{
+	size_t k = strlen(cwd);
+	if (k && cwd[k - 1] == '/') cwd[--k] = 0;
+	char *s = strrchr(cwd, '/');
+	if (s && s - cwd >= 5) s[1] = 0;
+	else copy(cwd, sizeof cwd, "sdmc:/");
+	if (strncmp(cwd, "sdmc:/", 6)) copy(cwd, sizeof cwd, "sdmc:/");
+	load_dir();
+}
+
+static void open_files(void)
+{
+	if (thinking) return;
+	load_dir();
+	view = V_FILES;
+}
+
+static void open_camera(void)
+{
+	if (thinking) return;
+	if (!cam_start(cam_inner)) { cam_stop(); say("The camera didn't start."); return; }
+	view = V_CAMERA;
+}
+
+static void close_camera(void)
+{
+	cam_stop();
+	go_chat();
+}
+
+static void type_message(void);
+
+static void attach(char kind, const char *path)
+{
+	pend_att = kind;
+	copy(pend_path, sizeof pend_path, path);
+	go_chat();
+	type_message();
+}
+
+static void snap(void)
+{
+	char path[128];
+	snprintf(path, sizeof path, BASE "/att/%lld.png", (long long)osGetTime());
+	bool ok = cam_save_png(path);
+	cam_stop();
+	if (!ok) { say("Couldn't save the photo."); go_chat(); return; }
+	attach('P', path);
+}
+
+static void start_talk(void)
+{
+	if (thinking) return;
+	if (!mic_start()) { say("The microphone didn't start."); return; }
+	voice_err[0] = 0;
+	view = V_TALK;
+}
+
+static void cancel_talk(void)
+{
+	mic_cancel();
+	go_chat();
+}
+
+static void send_voice(void)
+{
+	size_t n = 0;
+	unsigned char *wav = mic_stop(&n);
+	go_chat();
+	if (!wav) { say("That was too short. Hold on a bit longer."); return; }
+	free(voice_b64);
+	voice_b64 = b64_encode(wav, n);
+	free(wav);
+	if (!voice_b64) { say("Out of memory."); return; }
+	conv_add(&cur, 'U', VOICE_PH);
+	cur_commit();
+	send_chat();
+}
 
 static void new_chat(int project)
 {
@@ -1271,9 +1643,17 @@ static void open_chat(int id)
 static void type_message(void)
 {
 	if (thinking) return;
-	if (!kb("Message Spike", "", 1000, true, true, "Send")) return;
+	if (pend_att) {
+		if (!kb(pend_att == 'P' ? "Ask about this photo (or just Send)" : "Ask about this file (or just Send)", "", 1000, true, false, "Send")) return;
+	} else if (!kb("Message Spike", "", 1000, true, true, "Send")) return;
 	// first message of a new chat: create it now so the answer has a home
-	conv_add(&cur, 'U', kbuf);
+	Msg *m = conv_add(&cur, 'U', kbuf);
+	if (pend_att) {
+		m->att = pend_att;
+		m->att_path = strdup(pend_path);
+		if (!kbuf[0] && pend_att == 'F') { free(m->text); m->text = strdup("Read this file and tell me what it's about."); }
+		pend_att = 0;
+	}
 	cur_commit();
 	send_chat();
 }
@@ -1404,6 +1784,20 @@ static void activate_row(View v, int i)
 		if (r->ref == PS_DELETE) delete_row(v, i);
 		else projset_change(r->ref, 0);
 		break;
+	case R_UP: dir_up(); break;
+	case R_DIR: {
+		char p[300];
+		file_path(r->ref, p, sizeof p);
+		snprintf(cwd, sizeof cwd, "%s/", p);
+		load_dir();
+		break;
+	}
+	case R_FILE: {
+		char p[300];
+		file_path(r->ref, p, sizeof p);
+		attach(is_pic(p) ? 'P' : 'F', p);
+		break;
+	}
 	}
 }
 
@@ -1414,6 +1808,9 @@ static void back(void)
 	case V_CHAT: view = V_CHATS; break;
 	case V_PROJECT: view = V_PROJECTS; break;
 	case V_PROJEDIT: view = V_PROJECT; break;
+	case V_FILES: if (strcmp(cwd, "sdmc:/")) dir_up(); else go_chat(); break;
+	case V_CAMERA: close_camera(); break;
+	case V_TALK: cancel_talk(); break;
 	default: go_chat(); break;
 	}
 }
@@ -1448,6 +1845,15 @@ static void do_action(int a)
 	case A_STYLE: style_cycle(1); break;
 	case A_SETTINGS: view = V_SETTINGS; break;
 	case A_SOON: say("Coming in the next update!"); break;
+	case A_TALK: start_talk(); break;
+	case A_PHOTO: open_camera(); break;
+	case A_ATTACH: open_files(); break;
+	case A_UNATTACH: pend_att = 0; say("Removed"); break;
+	case A_SNAP: snap(); break;
+	case A_FLIP: cam_inner = !cam_inner; if (!cam_start(cam_inner)) close_camera(); break;
+	case A_VOICE_SEND: send_voice(); break;
+	case A_CANCEL: back(); break;
+	case A_UP: back(); break;
 	case A_TAB_CHATS: view = V_CHATS; armed = -1; break;
 	case A_TAB_PROJECTS: view = V_PROJECTS; armed = -1; break;
 	case A_EDITPROJ: view = V_PROJEDIT; sel[V_PROJEDIT] = 0; break;
@@ -1456,10 +1862,23 @@ static void do_action(int a)
 
 static void handle_keys(u32 down, u32 held)
 {
+	if (view == V_CAMERA) {
+		if (down & KEY_A) snap();
+		else if (down & KEY_X) do_action(A_FLIP);
+		else if (down & KEY_B) close_camera();
+		return;
+	}
+	if (view == V_TALK) {
+		if (down & (KEY_A | KEY_R)) send_voice();
+		else if (down & KEY_B) cancel_talk();
+		return;
+	}
 	if (view == V_CHAT) {
-		if (down & KEY_A) type_message();
-		if (down & KEY_R) retry();
-		if (down & KEY_B) view = V_CHATS;
+		if (down & KEY_A) { if (chat_err[0] && !thinking) retry(); else type_message(); }
+		if (down & KEY_R) start_talk();
+		if (down & KEY_DLEFT) open_camera();
+		if (down & KEY_DRIGHT) open_files();
+		if (down & KEY_B) { if (pend_att) do_action(A_UNATTACH); else view = V_CHATS; }
 		if (down & KEY_X) do_action(A_NEW);
 		if (down & KEY_Y) do_action(A_WEB);
 		if (down & KEY_L) style_cycle(1);
@@ -1487,8 +1906,8 @@ static void handle_keys(u32 down, u32 held)
 	fix_scroll(view, n);
 	int i = sel[view];
 	if (down & KEY_A) activate_row(view, i);
-	else if (down & KEY_X) rename_row(&rows[i]);
-	else if (down & KEY_Y) delete_row(view, i);
+	else if (down & KEY_X && view != V_FILES) rename_row(&rows[i]);
+	else if (down & KEY_Y && view != V_FILES) delete_row(view, i);
 	else if (down & KEY_B) back();
 	else if (down & (KEY_L | KEY_R) && (view == V_CHATS || view == V_PROJECTS)) { view = view == V_CHATS ? V_PROJECTS : V_CHATS; armed = -1; }
 	else if (down & (KEY_DLEFT | KEY_DRIGHT)) {
@@ -1530,6 +1949,12 @@ int main(void)
 		u32 down = hidKeysDown(), held = hidKeysHeld();
 		if (down & KEY_START) break;
 
+		if (view == V_CAMERA) cam_frame();
+		if (view == V_TALK) {
+			mic_poll();
+			if (mic_seconds() >= MIC_MAX_SECONDS - 0.1f) send_voice();
+		}
+
 		Job *j;
 		while ((j = net_poll())) {
 			if (j->tag == TAG_CHAT) got_chat(j);
@@ -1562,6 +1987,8 @@ int main(void)
 		C3D_FrameEnd(0);
 	}
 
+	cam_stop();
+	mic_cancel();
 	net_exit();
 	conv_clear(&cur);
 	conv_clear(&preview);

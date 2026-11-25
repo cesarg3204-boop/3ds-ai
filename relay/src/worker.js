@@ -49,8 +49,20 @@ export function parseRequest(body) {
     else if (k === "C") req.custom = v;
     else if (k === "I") req.project = v;
     else if (k === "W") req.web = v.trim() === "1";
-    else if (k === "U") req.messages.push({ role: "user", content: v });
+    else if (k === "U") req.messages.push({ role: "user", content: v, images: [] });
     else if (k === "A") req.messages.push({ role: "assistant", content: v });
+    else if (req.messages.length) {
+      const m = req.messages[req.messages.length - 1];
+      if (m.role !== "user") continue;
+      if (k === "G") { // picture: G<TAB>mime<TAB>base64
+        const t = v.indexOf("\t");
+        if (t > 0) m.images.push({ mime: v.slice(0, t), data: v.slice(t + 1) });
+      } else if (k === "X") { // text file: X<TAB>name<TAB>content
+        const t = v.indexOf("\t");
+        const name = t > 0 ? v.slice(0, t) : "file.txt", content = t > 0 ? v.slice(t + 1) : v;
+        m.content += `\n\n[Attached file "${name}"]\n${content.slice(0, 20000)}`;
+      } else if (k === "V") m.voice = v; // recorded speech, base64 WAV
+    }
   }
   return req;
 }
@@ -266,7 +278,10 @@ export async function gemini(req, history, env, today, doFetch = fetch) {
     (req.persona === "searcher" ? " Always search, for every question." : "");
   const body = {
     systemInstruction: { parts: [{ text: sys }] },
-    contents: history.map((m) => ({ role: m.role === "user" ? "user" : "model", parts: [{ text: m.content }] })),
+    contents: history.map((m) => ({
+      role: m.role === "user" ? "user" : "model",
+      parts: [...(m.images || []).map((i) => ({ inline_data: { mime_type: i.mime, data: i.data } })), { text: m.content || "." }],
+    })),
     generationConfig: { maxOutputTokens: 2048, temperature: 0.5 },
   };
   if (search) body.tools = [{ google_search: {} }];
@@ -298,21 +313,62 @@ export async function gemini(req, history, env, today, doFetch = fetch) {
   throw last || new Error("Gemini didn't answer");
 }
 
+// ---------- voice ----------
+
+export async function transcribe(env, wavB64, doFetch = fetch) {
+  if (env.AI) {
+    try {
+      const r = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: wavB64 });
+      const t = (r && (r.text || r.result?.text) || "").trim();
+      if (t) return t;
+    } catch {}
+  }
+  if (env.GEMINI_KEY) {
+    for (const m of GEMINI_MODELS) {
+      const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [
+          { inline_data: { mime_type: "audio/wav", data: wavB64 } },
+          { text: "Transcribe this recording exactly, in the language it is spoken in (English or Spanish). Output only the words, nothing else." },
+        ] }] }),
+      }).catch(() => null);
+      if (!res || !res.ok) continue;
+      const j = await res.json().catch(() => ({}));
+      const t = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+      if (t) return t;
+    }
+  }
+  return "";
+}
+
+const PHOTO_ONLY = "(I sent you this picture without a question. Tell me what it is and anything useful about it.)";
+
 export async function chat(body, env, today) {
   const req = parseRequest(body);
   const history = req.messages.slice(-16);
   if (!history.length || history[history.length - 1].role !== "user") return "ERR\tNothing to answer.\n";
+  const lastMsg = history[history.length - 1];
+  const extra = [];
+  if (lastMsg.voice) {
+    const t = await transcribe(env, lastMsg.voice);
+    if (!t) return "ERR\tI couldn't make out what you said. Try again a bit closer to the mic.\n";
+    lastMsg.content = t;
+    extra.push(`T\t${esc(t)}`);
+  }
+  for (const m of history) if (m.role === "user" && !m.content.trim() && m.images && m.images.length) m.content = PHOTO_ONLY;
+  const hasPhoto = !!(lastMsg.images && lastMsg.images.length);
+  const out = (answer, sources) => ["OK", ...extra, `A\t${esc(answer)}`, ...sources.map((r) => `S\t${esc(r.title)}\t${esc(r.link)}`)].join("\n") + "\n";
   if (env.GEMINI_KEY) {
     try {
       const g = await gemini(req, history, env, today);
-      const lines = ["OK", `A\t${esc(plain(g.text))}`];
-      for (const r of g.sources) lines.push(`S\t${esc(r.title)}\t${esc(r.link)}`);
-      return lines.join("\n") + "\n";
+      return out(plain(g.text), g.sources);
     } catch (e) {
-      if (!env.AI) throw e;
+      if (!env.AI || hasPhoto) throw e;
       // daily limit reached or Gemini down: fall back to Cloudflare's own AI below
     }
   }
+  if (hasPhoto) return "ERR\tPhotos need Gemini. Add a GEMINI_KEY to your relay (see the setup steps).\n";
   const force = req.persona === "searcher";
   let results = null;
   if (req.web || force) {
@@ -322,11 +378,10 @@ export async function chat(body, env, today) {
       results.query = q;
     }
   }
-  const messages = [{ role: "system", content: systemPrompt(req, results, today) }, ...history];
+  const flat = history.map((m) => ({ role: m.role, content: m.images && m.images.length ? `${m.content}\n(There was a photo here that you can't see.)` : m.content }));
+  const messages = [{ role: "system", content: systemPrompt(req, results, today) }, ...flat];
   const answer = plain(await runAI(env, messages));
-  const lines = ["OK", `A\t${esc(answer)}`];
-  for (const r of results || []) lines.push(`S\t${esc(r.title)}\t${esc(r.link)}`);
-  return lines.join("\n") + "\n";
+  return out(answer, results || []);
 }
 
 // ---------- entry ----------
