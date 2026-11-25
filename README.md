@@ -10,7 +10,8 @@ A chat assistant for the Nintendo 3DS, with a little blue sprout named Spike.
 1. Go to dash.cloudflare.com, then **Workers & Pages**, **Create**, **Create Worker**. Name it `spike-ai` and press **Deploy**.
 2. Press **Edit code**, delete what's there, paste all of `relay/src/worker.js`, and press **Deploy**.
 3. In the worker, open **Settings**, **Bindings**, **Add binding**, choose **Workers AI**, and name it `AI`. Save.
-4. Open `https://spike-ai.<your-subdomain>.workers.dev/v1/ping` in a browser. It should say `SPIKE OK  ai`.
+4. (Smarter Spike, free) Get an API key at aistudio.google.com (Get API key, Create API key). In the worker's **Settings**, **Variables and Secrets**, add a **Secret** named `GEMINI_KEY` with that key. Spike then uses Gemini with Google Search, and falls back to Cloudflare's AI if Gemini's daily limit runs out.
+5. Open `https://spike-ai.<your-subdomain>.workers.dev/v1/ping` in a browser. It should say `SPIKE OK  ai`.
 
 ## Set up the app
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText } from "../src/worker.js";
+import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini } from "../src/worker.js";
 
 let passed = 0;
 async function test(name, fn) { try { await fn(); passed++; console.log("ok -", name); } catch (e) { console.log("FAIL -", name); console.log(e); process.exitCode = 1; } }
@@ -58,7 +58,7 @@ await test("falls back to another model", async () => {
 
 await test("ping", async () => {
   const r = await worker.fetch(new Request("https://x/v1/ping"), { AI: {} });
-  assert.equal(await r.text(), "SPIKE OK\tai\n");
+  assert.equal(await r.text(), "SPIKE OK\tai\tcloudflare\n");
 });
 
 await test("planner keeps the topic of the chat", async () => {
@@ -87,6 +87,29 @@ await test("answer text from different model shapes", () => {
   assert.equal(answerText({ choices: [{ message: { content: "a" } }] }), "a");
   assert.equal(answerText({ output: [{ type: "reasoning" }, { type: "message", content: [{ type: "output_text", text: "b" }] }] }), "b");
   assert.equal(answerText({ response: "c" }), "c");
+});
+
+await test("plain removes characters the 3DS can't show", () => {
+  assert.equal(plain("high\u2011protein 16\u202Fg \u201Cchewy\u201D bar 4\u3011. Cite \u30104\u2020L1-L3\u3011 \u{1F600}"), 'high-protein 16 g "chewy" bar 4. Cite [4]');
+});
+
+await test("gemini request and sources", async () => {
+  let url, sent;
+  const fakeFetch = async (u, o) => { url = u; sent = JSON.parse(o.body); return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "Quest chips have 18g protein." }] }, groundingMetadata: { groundingChunks: [{ web: { uri: "https://r/1", title: "questnutrition.com" } }, { web: { uri: "https://r/2", title: "questnutrition.com" } }] } }] }), { status: 200 }); };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: true }, [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }, { role: "user", content: "quest chips protein" }], { GEMINI_KEY: "k" }, "d", fakeFetch);
+  assert.match(url, /gemini-flash-latest:generateContent/);
+  assert.deepEqual(sent.contents.map((c) => c.role), ["user", "model", "user"]);
+  assert.ok(sent.tools[0].google_search);
+  assert.equal(g.text, "Quest chips have 18g protein.");
+  assert.equal(g.sources.length, 1);
+});
+
+await test("gemini tries the next model when one is busy", async () => {
+  const tried = [];
+  const fakeFetch = async (u) => { tried.push(u); return tried.length === 1 ? new Response("{}", { status: 429 }) : new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] })); };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: false }, [{ role: "user", content: "hi" }], { GEMINI_KEY: "k" }, "d", fakeFetch);
+  assert.equal(g.text, "ok");
+  assert.equal(tried.length, 2);
 });
 
 console.log(`${passed} tests passed`);

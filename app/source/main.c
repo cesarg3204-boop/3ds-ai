@@ -656,10 +656,9 @@ static void got_ping(Job *j)
 	if (!j->ok) { snprintf(ping_status, sizeof ping_status, "Can't reach it: %s", j->err); return; }
 	if (strncmp(j->body, "SPIKE OK", 8)) { copy(ping_status, sizeof ping_status, "That address answered, but it isn't a Spike relay."); return; }
 	bool ai = strstr(j->body, "\tai") != NULL;
-	bool key = strstr(j->body, "key-wrong") == NULL;
-	if (!key) copy(ping_status, sizeof ping_status, "Relay found, but the password is wrong.");
-	else if (!ai) copy(ping_status, sizeof ping_status, "Relay found, but Workers AI isn't turned on (binding named AI).");
-	else copy(ping_status, sizeof ping_status, "All good! Spike is ready.");
+	if (!ai) copy(ping_status, sizeof ping_status, "Relay found, but no AI is set up on it yet.");
+	else if (strstr(j->body, "gemini")) copy(ping_status, sizeof ping_status, "All good! Spike is using Gemini with Google Search.");
+	else copy(ping_status, sizeof ping_status, "All good! Spike is using Cloudflare AI (add GEMINI_KEY for a smarter Spike).");
 }
 
 // ---------------------------------------------------------------- drawing: Spike

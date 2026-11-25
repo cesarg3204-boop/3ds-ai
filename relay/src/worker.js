@@ -4,7 +4,8 @@
 // relay adds Spike's personality, optionally looks things up on the web, asks
 // Cloudflare Workers AI (free daily allowance) and sends back plain text.
 //
-// Setup (Cloudflare dashboard): Workers AI binding named AI. Optional variable MODEL.
+// Setup (Cloudflare dashboard): Workers AI binding named AI, and (smarter) a secret
+// GEMINI_KEY from aistudio.google.com. Optional variables MODEL, GEMINI_MODEL.
 
 // Smartest first; if one fails (or isn't on your account) the next is tried.
 const MODELS = [
@@ -206,12 +207,21 @@ export function systemPrompt(req, results, today) {
   return parts.join("\n\n");
 }
 
-// Removes markdown the 3DS can't show.
+// Removes markdown and characters the 3DS font can't show (they appear as "?" boxes).
 export function plain(s) {
   return String(s)
+    .replace(/【(\d+)[^】]*】/g, "[$1]").replace(/[【】〖〗]/g, "")
     .replace(/\*\*(.+?)\*\*/g, "$1").replace(/__(.+?)__/g, "$1")
-    .replace(/^#{1,6}\s*/gm, "").replace(/^\s*[*•]\s+/gm, "- ").replace(/`{1,3}/g, "")
-    .replace(/\n{3,}/g, "\n\n").trim();
+    .replace(/^#{1,6}\s*/gm, "").replace(/^\s*[*•·]\s+/gm, "- ").replace(/`{1,3}/g, "")
+    .replace(/[‐-―−]/g, "-")
+    .replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"')
+    .replace(/…/g, "...").replace(/[•●▪]/g, "-")
+    .replace(/→/g, "->").replace(/←/g, "<-").replace(/≈/g, "~").replace(/≤/g, "<=").replace(/≥/g, ">=")
+    .replace(/[  -   　]/g, " ")
+    .replace(/[​-‍⁠﻿️]/g, "")
+    .replace(/[☀-➿]/g, "")
+    .replace(/[\u{10000}-\u{10FFFF}]/gu, "")
+    .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // Pulls the text out of the different answer shapes Workers AI models use.
@@ -245,10 +255,64 @@ async function runAI(env, messages) {
   throw last || new Error("no model answered");
 }
 
+// ---------- Gemini (smarter, with Google Search built in) ----------
+
+const GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.0-flash"];
+
+export async function gemini(req, history, env, today, doFetch = fetch) {
+  const search = req.web || req.persona === "searcher";
+  let sys = systemPrompt(req, null, today);
+  if (search) sys += "\n\nYou can use Google Search. Search before answering anything about a specific product, brand, food or nutrition facts, game, person, place, price, score, release or news, or anything you aren't sure of. Base numbers on what you find. Don't write citation numbers; sources are shown under your answer." +
+    (req.persona === "searcher" ? " Always search, for every question." : "");
+  const body = {
+    systemInstruction: { parts: [{ text: sys }] },
+    contents: history.map((m) => ({ role: m.role === "user" ? "user" : "model", parts: [{ text: m.content }] })),
+    generationConfig: { maxOutputTokens: 2048, temperature: 0.5 },
+  };
+  if (search) body.tools = [{ google_search: {} }];
+  const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
+  let last;
+  for (const m of models) {
+    try {
+      const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
+        body: JSON.stringify(body),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { last = new Error(`Gemini ${res.status}: ${j.error?.message || ""}`.slice(0, 160)); if (res.status === 400 || res.status === 403) break; continue; }
+      const c = j.candidates && j.candidates[0];
+      const text = (c?.content?.parts || []).map((p) => p.text || "").join("");
+      if (!text.trim()) { last = new Error("Gemini gave an empty answer"); continue; }
+      const seen = new Set(), sources = [];
+      for (const g of c.groundingMetadata?.groundingChunks || []) {
+        const w = g.web;
+        if (!w || !w.uri || seen.has(w.title || w.uri)) continue;
+        seen.add(w.title || w.uri);
+        sources.push({ title: w.title || w.uri, link: w.uri });
+        if (sources.length >= 6) break;
+      }
+      return { text, sources };
+    } catch (e) { last = e; }
+  }
+  throw last || new Error("Gemini didn't answer");
+}
+
 export async function chat(body, env, today) {
   const req = parseRequest(body);
   const history = req.messages.slice(-16);
   if (!history.length || history[history.length - 1].role !== "user") return "ERR\tNothing to answer.\n";
+  if (env.GEMINI_KEY) {
+    try {
+      const g = await gemini(req, history, env, today);
+      const lines = ["OK", `A\t${esc(plain(g.text))}`];
+      for (const r of g.sources) lines.push(`S\t${esc(r.title)}\t${esc(r.link)}`);
+      return lines.join("\n") + "\n";
+    } catch (e) {
+      if (!env.AI) throw e;
+      // daily limit reached or Gemini down: fall back to Cloudflare's own AI below
+    }
+  }
   const force = req.persona === "searcher";
   let results = null;
   if (req.web || force) {
@@ -275,10 +339,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/v1/ping") {
-      return text(`SPIKE OK\t${env.AI ? "ai" : "no-ai"}\n`);
+      return text(`SPIKE OK\t${env.AI || env.GEMINI_KEY ? "ai" : "no-ai"}\t${env.GEMINI_KEY ? "gemini" : "cloudflare"}\n`);
     }
     const body = request.method === "POST" ? await request.text() : "";
-    if (!env.AI) return text("ERR\tWorkers AI isn't turned on for this relay yet (binding named AI).\n");
+    if (!env.AI && !env.GEMINI_KEY) return text("ERR\tNo AI set up yet: add the Workers AI binding named AI, or a GEMINI_KEY secret.\n");
     try {
       if (url.pathname === "/v1/chat" && request.method === "POST") {
         const today = new Date().toISOString().slice(0, 10);
