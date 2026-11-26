@@ -38,10 +38,10 @@ Chats, projects and settings are saved in `sdmc:/3ds/SpikeAI/`.
 
 | Where | Button | Does |
 |---|---|---|
-| Chat | A | Type a message |
+| Chat | D-Pad | Move the highlight between buttons (Photo, Attach...) |
+| Chat | A | Press the highlighted button (Type a message by default) |
+| Chat | Circle Pad | Scroll the chat |
 | Chat | R | Talk (record your voice) |
-| Chat | D-Pad Left | Take a photo |
-| Chat | D-Pad Right | Attach a picture or .txt from the SD card |
 | Chat | A (after an error) | Try again |
 | Chat | X | New chat |
 | Chat | Y | Web lookups on/off |
