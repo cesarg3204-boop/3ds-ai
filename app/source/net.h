@@ -30,7 +30,7 @@ typedef struct Job {
 	struct Job *next;
 } Job;
 
-bool net_init(void);
+bool net_init(void (*step)(const char *what, long rc));
 void net_exit(void);
 
 Job *job_new(JobKind kind, int tag, const char *url);

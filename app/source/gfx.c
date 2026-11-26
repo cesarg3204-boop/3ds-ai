@@ -68,13 +68,22 @@ static float char_w(u32 cp)
 	return w;
 }
 
-void gfx_init(void)
+Result gfx_init(void)
 {
 	s_buf = C2D_TextBufNew(12000);
-	fontEnsureMapped();
+	// The system font is shared with the HOME Menu. Right after launch it can
+	// briefly be unavailable, so retry for up to ~3 seconds before giving up.
+	Result rc = fontEnsureMapped();
+	for (int i = 0; i < 30 && R_FAILED(rc); i++) {
+		svcSleepThread(100000000LL);
+		rc = fontEnsureMapped();
+	}
 	s_font = fontGetSystemFont();
 	for (int i = 0; i < 128; i++) s_cw[i] = -1;
 	gfx_set_theme(true);
+	if (R_SUCCEEDED(rc) && !s_font) rc = -1;
+	if (R_SUCCEEDED(rc) && !s_buf) rc = -2;
+	return rc;
 }
 
 void gfx_exit(void)

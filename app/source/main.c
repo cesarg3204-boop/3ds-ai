@@ -2215,48 +2215,112 @@ static void handle_keys(u32 down, u32 held)
 
 // ---------------------------------------------------------------- main
 
-static void boot_step(const char *what)
+// Start-up check: every step is shown on both screens and saved to boot.txt.
+// This build waits for A after each step, so if Spike ever freezes while
+// starting, the last line on screen says exactly where. START skips the
+// pauses. Once the app is drawing, the log can't be shown any more, so
+// "first frame" and "running OK" are only saved to boot.txt.
+static PrintConsole con_top, con_bot;
+static bool boot_pause = true, boot_gpu;
+static int boot_n;
+static bool boot_started;
+static u64 boot_t0;
+
+static void boot_show(void)
 {
-	printf("- %s\n", what);
 	gfxFlushBuffers();
-	gfxSwapBuffers();
+	if (!boot_gpu) gfxSwapBuffers();
 	gspWaitForVBlank();
-	FILE *f = fopen(BASE "/boot.txt", !strcmp(what, "SD card folders") ? "w" : "a");
-	if (f) { fprintf(f, "%s\n", what); fclose(f); }
 }
+
+static void boot_log(const char *line)
+{
+	FILE *f = fopen(BASE "/boot.txt", boot_started ? "a" : "w");
+	boot_started = true;
+	if (f) { fprintf(f, "%s\n", line); fclose(f); }
+}
+
+static void boot_step(const char *what, long rc)
+{
+	char line[160];
+	u32 ms = (u32)((osGetTime() - boot_t0));
+	boot_n++;
+	if (rc) snprintf(line, sizeof line, "%2d %s  ERROR %08lX  (%lums)", boot_n, what, (unsigned long)rc, (unsigned long)ms);
+	else snprintf(line, sizeof line, "%2d %s  ok  (%lums)", boot_n, what, (unsigned long)ms);
+	boot_log(line);
+	consoleSelect(&con_top);
+	printf("%s\n", line);
+	consoleSelect(&con_bot);
+	printf("%s\n", line);
+	if (!boot_pause) { boot_show(); return; }
+	printf("\x1b[33mA = next step  START = skip\x1b[0m");
+	boot_show();
+	while (aptMainLoop()) {
+		hidScanInput();
+		u32 k = hidKeysDown();
+		if (k & KEY_A) break;
+		if (k & KEY_START) { boot_pause = false; break; }
+		gspWaitForVBlank();
+	}
+	printf("\r\x1b[2K");
+}
+
+static void net_step(const char *what, long rc) { boot_step(what, rc); }
 
 int main(void)
 {
 	gfxInitDefault();
-	// Start-up steps are printed on the top screen (and saved to boot.txt), so
-	// if Spike ever freezes while starting, the last line says where.
-	consoleInit(GFX_TOP, NULL);
-	printf("Spike AI is starting...\n\n");
-	boot_step("SD card folders");
+	boot_t0 = osGetTime();
+	consoleInit(GFX_TOP, &con_top);
+	consoleInit(GFX_BOTTOM, &con_bot);
+	consoleSelect(&con_top);
+	printf("Spike AI is starting (check mode)\n\n");
+	consoleSelect(&con_bot);
+	printf("Write down the LAST line if it\nfreezes. Hold POWER to turn off.\n");
+	boot_step("console", 0);
 	ensure_dirs();
-	boot_step("romfs");
-	romfsInit();
-	boot_step("settings");
+	boot_step("SD card folders", 0);
+	Result rc = romfsInit();
+	boot_step("romfs", rc);
 	cfg_load();
-	boot_step("chat list");
+	boot_step("settings", 0);
 	index_load();
-	boot_step("network");
-	net_init();
+	boot_step("chat list", 0);
+	net_init(net_step);
 	net_set_verify(cfg.verify);
-	boot_step("graphics");
-	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
-	C2D_Init(8192);
+	{
+		char m[80];
+		snprintf(m, sizeof m, "memory: %luKB free, %luKB linear",
+			(unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024), (unsigned long)(linearSpaceFree() / 1024));
+		boot_step(m, 0);
+	}
+	boot_gpu = true;
+	bool c3d = C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+	boot_step("graphics: citro3d", c3d ? 0 : -1);
+	bool c2d = C2D_Init(8192);
 	C2D_Prepare();
+	boot_step("graphics: citro2d", c2d ? 0 : -1);
 	C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 	C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
-	boot_step("font");
-	gfx_init();
+	boot_step("graphics: screens", top && bot ? 0 : -1);
+	rc = gfx_init();
+	boot_step("font", rc);
 	gfx_set_theme(true);
-	boot_step("last chat");
 	if (cfg.last_chat && chat_find(cfg.last_chat)) open_chat(cfg.last_chat);
 	if (!cfg.relay[0]) { view = V_SETTINGS; sel[V_SETTINGS] = S_RELAY; }
-
-	boot_step("ready");
+	boot_step("last chat", 0);
+	consoleSelect(&con_bot);
+	printf("\nNext: Spike's screen. If it stays\nblack/frozen, the problem is\ndrawing (step %d).\n", boot_n + 1);
+	if (boot_pause) {
+		printf("\x1b[33mA = start Spike\x1b[0m");
+		boot_show();
+		while (aptMainLoop()) {
+			hidScanInput();
+			if (hidKeysDown() & (KEY_A | KEY_START)) break;
+			gspWaitForVBlank();
+		}
+	}
+	int frames = 0;
 	bool touching = false;
 	while (aptMainLoop()) {
 		hidScanInput();
@@ -2300,6 +2364,10 @@ int main(void)
 		C2D_SceneBegin(top);
 		draw_top();
 		C3D_FrameEnd(0);
+		if (frames < 121 && (++frames == 1 || frames == 120)) {
+			boot_n++;
+			boot_log(frames == 1 ? "first frame ok" : "running OK (2 seconds)");
+		}
 	}
 
 	cam_stop();

@@ -277,24 +277,29 @@ static void load_ca(void)
 	fclose(f);
 }
 
-bool net_init(void)
+bool net_init(void (*step)(const char *what, long rc))
 {
 	LightLock_Init(&s_lock);
 	LightEvent_Init(&s_event, RESET_ONESHOT);
 
 	s_socbuf = memalign(SOC_ALIGN, SOC_BUFFERSIZE);
-	if (!s_socbuf || R_FAILED(socInit(s_socbuf, SOC_BUFFERSIZE))) {
+	Result rc = s_socbuf ? socInit(s_socbuf, SOC_BUFFERSIZE) : -1;
+	if (step) step("network: wifi sockets", rc);
+	if (!s_socbuf || R_FAILED(rc)) {
 		free(s_socbuf);
 		s_socbuf = NULL;
 	}
-	curl_global_init(CURL_GLOBAL_DEFAULT);
+	long crc = curl_global_init(CURL_GLOBAL_DEFAULT);
 	s_curl = curl_easy_init();
+	if (step) step("network: curl", s_curl ? crc : -1);
 	load_ca();
+	if (step) step("network: certificates", s_ca ? 0 : -1);
 
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	s_quit = false;
 	s_thread = threadCreate(worker, NULL, 128 * 1024, prio + 1, -2, false);
+	if (step) step("network: worker thread", s_thread ? 0 : -1);
 	return s_thread != NULL && s_socbuf != NULL;
 }
 

@@ -11,7 +11,7 @@ extern const u32 CH_COLORS[8];
 extern const char *CH_COLOR_NAMES[8];
 extern const char *ICON_NAMES[10];
 
-void gfx_init(void);
+Result gfx_init(void);
 void gfx_exit(void);
 void gfx_set_theme(bool dark);
 void gfx_frame_start(void);  // call after C3D_FrameBegin
