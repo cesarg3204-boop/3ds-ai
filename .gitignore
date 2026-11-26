@@ -5,3 +5,4 @@ app/*.elf
 app/*.map
 node_modules/
 .DS_Store
+app/*.cia

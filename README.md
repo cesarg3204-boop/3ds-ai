@@ -52,6 +52,10 @@ Chats, projects and settings are saved in `sdmc:/3ds/SpikeAI/`.
 | Lists | L / R | Switch Chats and Projects |
 | Anywhere | START | Exit |
 
+## Install as a .cia (Home Menu icon)
+
+Install `SpikeAI.cia` with FBI (on a real 3DS) or File > Install CIA (in an emulator). It shows up on the Home Menu like a normal app; chats and settings are the same files as the .3dsx version. It has no animated banner yet (the top screen stays plain when you pick it).
+
 ## Build
 
 ```
