@@ -1184,6 +1184,7 @@ typedef enum {
 typedef struct { float x, y, w, h; int act; } Hit;
 static Hit hits[48];
 static int nhits;
+static int chat_focus = A_TYPE;   // chat button picked with the D-Pad
 
 static void hit(float x, float y, float w, float h, int act)
 {
@@ -1195,6 +1196,7 @@ static void button(float x, float y, float w, float h, const char *label, const 
 	// style 0 normal, 1 primary, 2 disabled
 	u32 bg = style == 1 ? T.accent : T.card;
 	u32 fg = style == 2 ? T.faint : style == 1 ? rgba(255, 255, 255, 255) : T.text;
+	if (view == V_CHAT && act == chat_focus && act != A_NONE) rrect(x - 3, y - 3, w + 6, h + 6, 12, rgba(255, 255, 255, 235));
 	rrect(x, y, w, h, 9, bg);
 	float fs = h >= 40 ? 0.55f : 0.47f;
 	float ty = y + (hint && h >= 40 ? h / 2 - 15 : h / 2 - text_line_h(fs) / 2);
@@ -1259,8 +1261,8 @@ static void draw_chat_bottom(void)
 	} else {
 		int st = thinking ? 2 : 0;
 		button(12, 110, 94, 44, "Talk", "R", A_TALK, st);
-		button(113, 110, 94, 44, "Photo", "Left", A_PHOTO, st);
-		button(214, 110, 94, 44, "Attach", "Right", A_ATTACH, st);
+		button(113, 110, 94, 44, "Photo", NULL, A_PHOTO, st);
+		button(214, 110, 94, 44, "Attach", NULL, A_ATTACH, st);
 	}
 
 	char web[24], style[32];
@@ -1270,8 +1272,7 @@ static void draw_chat_bottom(void)
 	button(87, 164, 70, 42, "New", "X", A_NEW, 0);
 	button(162, 164, 70, 42, web, "Y", A_WEB, cfg.web ? 1 : 0);
 	button(237, 164, 71, 42, style, "L", A_STYLE, 0);
-	draw_footer("D-Pad scroll   SELECT settings   START exit");
-	hit(240, 214, 80, 26, A_SETTINGS);
+	draw_footer("D-Pad move  A press  Circle Pad scroll  START exit");
 	draw_toast();
 }
 
@@ -2066,6 +2067,27 @@ static void activate_row(View v, int i)
 	}
 }
 
+// Moves the chat's D-Pad highlight to the nearest button in that direction.
+static void move_focus(int dx, int dy)
+{
+	int cur_i = -1;
+	for (int i = 0; i < nhits; i++) if (hits[i].act == chat_focus) cur_i = i;
+	if (cur_i < 0) { chat_focus = A_TYPE; return; }
+	float cx = hits[cur_i].x + hits[cur_i].w / 2, cy = hits[cur_i].y + hits[cur_i].h / 2;
+	int best = -1;
+	float bs = 1e9f;
+	for (int i = 0; i < nhits; i++) {
+		if (i == cur_i || hits[i].act == A_NONE || hits[i].act == chat_focus) continue;
+		float x = hits[i].x + hits[i].w / 2, y = hits[i].y + hits[i].h / 2;
+		float along = dx ? (x - cx) * dx : (y - cy) * dy;
+		float side = dx ? fabsf(y - cy) : fabsf(x - cx);
+		if (along < 8) continue;
+		float sc = along + side * 2;
+		if (sc < bs) { bs = sc; best = i; }
+	}
+	if (best >= 0) chat_focus = hits[best].act;
+}
+
 static void back(void)
 {
 	armed = -1;
@@ -2140,18 +2162,22 @@ static void handle_keys(u32 down, u32 held)
 		return;
 	}
 	if (view == V_CHAT) {
-		if (down & KEY_A) { if (chat_err[0] && !thinking) retry(); else type_message(NULL); }
+		if (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT))
+			move_focus(down & KEY_DLEFT ? -1 : down & KEY_DRIGHT ? 1 : 0, down & KEY_DUP ? -1 : down & KEY_DDOWN ? 1 : 0);
+		if (down & KEY_A) {
+			bool shown = false;
+			for (int i = 0; i < nhits; i++) if (hits[i].act == chat_focus) shown = true;
+			if (chat_err[0] && !thinking && (chat_focus == A_TYPE || !shown)) retry();
+			else if (shown && chat_focus != A_TYPE) do_action(chat_focus);
+			else type_message(NULL);
+		}
 		if (down & KEY_R) start_talk();
-		if (down & KEY_DLEFT) open_camera();
-		if (down & KEY_DRIGHT) open_files();
 		if (down & KEY_B) { if (pend_att) do_action(A_UNATTACH); else view = V_CHATS; }
 		if (down & KEY_X) do_action(A_NEW);
 		if (down & KEY_Y) do_action(A_WEB);
 		if (down & KEY_L) style_cycle(1);
 		if (down & KEY_SELECT) view = V_SETTINGS;
 		float sp = 0;
-		if (held & KEY_DUP) sp += 5;
-		if (held & KEY_DDOWN) sp -= 5;
 		circlePosition cp;
 		hidCircleRead(&cp);
 		if (abs(cp.dy) > 20) sp += cp.dy / 16.0f;

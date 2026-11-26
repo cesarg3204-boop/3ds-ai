@@ -435,9 +435,16 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
   const tagged = mentioned(history[history.length - 1].content, mcpServers(env));
   if (tagged.length) {
     const before = errs.length;
-    const r = await geminiWithTools(req, contents, env, today, models, doFetch, errs, tagged);
-    if (r) return r;
-    mcpNote = { title: `MCP tools didn't work: ${(errs.slice(before)[0] || "unknown").slice(0, 120)}`, link: "" };
+    const { tools, errors } = await mcpConnect(env, doFetch, tagged);
+    errs.push(...errors);
+    if (tools.length) {
+      const sys = toolPrompt(req, today, tools);
+      let r = await geminiWithTools(sys, contents, env, models, doFetch, errs, tools);
+      // Gemini busy or out of free uses: Cloudflare's own AI can use the tools too
+      if (!r && env.AI) r = await cloudflareWithTools(env, sys, history, tools, errs);
+      if (r) return r;
+    }
+    mcpNote = { title: `@tools didn't work: ${shortErrs(errs.slice(before))}`.slice(0, 200), link: "" };
   }
 
   // 1) Gemini with Google Search built in
@@ -478,18 +485,29 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
   throw new Error(`Gemini didn't answer. ${errs.slice(-2).join(" | ")}`.slice(0, 230));
 }
 
-// Lets Gemini call MCP tools: ask, run the tools it picks, give it the results, repeat.
-async function geminiWithTools(req, contents, env, today, models, doFetch, errs, only) {
-  const { tools, errors } = await mcpConnect(env, doFetch, only);
-  if (errors.length) errs.push(...errors);
-  if (!tools.length) return null;
-  const sys = systemPrompt(req, null, today) +
+// "gemini-3-flash-preview+tools: 429 You exceeded..." -> "3-flash-preview 429 (out of free uses)"
+export function shortErrs(list) {
+  if (!list.length) return "unknown error";
+  return list.map((e) => {
+    const m = /^gemini-([\w.-]+)\+tools: (\d{3})/.exec(e);
+    if (!m) return e.slice(0, 70);
+    const why = m[2] === "429" ? " (limit reached)" : m[2] === "503" ? " (busy)" : "";
+    return `${m[1]} ${m[2]}${why}`;
+  }).join(", ");
+}
+
+function toolPrompt(req, today, tools) {
+  return systemPrompt(req, null, today) +
     "\n\nThe user tagged " + [...new Set(tools.map((t) => "@" + t.server))].join(", ") + " in their message to use those connected tools. Use them for this request (e.g. asking to send yourself a WhatsApp means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
-    "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. Reading and searching don't need confirmation. Don't write citation numbers.";
+    "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. If the user's message already says exactly what to send and to whom (like 'send me a WhatsApp saying hello'), that counts as their yes: do it. Reading and searching don't need confirmation. Don't write citation numbers.";
+}
+
+// Lets Gemini call MCP tools: ask, run the tools it picks, give it the results, repeat.
+async function geminiWithTools(sys, contents, env, models, doFetch, errs, tools) {
   const decl = tools.map((t) => ({ name: t.fn, description: `[${t.server}] ${t.description}`, parametersJsonSchema: t.schema }));
   const convo = [...contents];
   const used = [];
-  for (const m of models.slice(0, 3)) {
+  for (const m of models) {
     try {
       for (let round = 0; round < 5; round++) {
         const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
@@ -525,6 +543,46 @@ async function geminiWithTools(req, contents, env, today, models, doFetch, errs,
     convo.length = contents.length; // start over with the next model
     used.length = 0;
   }
+  return null;
+}
+
+// Same loop with Cloudflare's AI, used when Gemini can't (free limit, busy).
+const CF_TOOL_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+async function cloudflareWithTools(env, sys, history, tools, errs) {
+  const defs = tools.map((t) => ({ type: "function", function: { name: t.fn, description: `[${t.server}] ${t.description}`.slice(0, 400), parameters: t.schema } }));
+  const msgs = [{ role: "system", content: sys }, ...history.map((m) => ({ role: m.role, content: m.content || "." }))];
+  const used = [];
+  try {
+    for (let round = 0; round < 5; round++) {
+      const r = await env.AI.run(CF_TOOL_MODEL, { messages: msgs, tools: defs, max_tokens: 1200, temperature: 0.3 });
+      const calls = (r && r.tool_calls) || [];
+      if (!calls.length) {
+        const text = answerText(r);
+        if (text && String(text).trim()) return { text: String(text), sources: used.map((u) => ({ title: `Used ${u}`, link: "" })) };
+        errs.push("cloudflare+tools: empty answer");
+        return null;
+      }
+      const results = [];
+      for (const c of calls.slice(0, 4)) {
+        const name = c.name || c.function?.name;
+        let args = c.arguments ?? c.function?.arguments ?? {};
+        if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = {}; } }
+        const t = tools.find((x) => x.fn === name);
+        let out;
+        if (!t) out = "error: unknown tool";
+        else {
+          used.push(`${t.server}: ${t.name}`);
+          try { const res = await t.client.call(t.name, args); out = (res.error ? "error: " : "") + res.text; }
+          catch (e) { out = `error: ${e.message}`; }
+        }
+        results.push(`[${name}] ${String(out).slice(0, 6000)}`);
+      }
+      msgs.push({ role: "assistant", content: `(I called: ${calls.map((c) => c.name || c.function?.name).join(", ")})` });
+      msgs.push({ role: "user", content: `Results from the tools you called:\n\n${results.join("\n\n")}\n\nNow answer me in plain words (or call another tool if you really need to).` });
+    }
+    errs.push("cloudflare+tools: too many rounds");
+  } catch (e) { errs.push(`cloudflare+tools: ${e.message}`.slice(0, 120)); }
   return null;
 }
 

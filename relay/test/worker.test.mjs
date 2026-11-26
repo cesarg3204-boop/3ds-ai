@@ -223,4 +223,27 @@ await test("skills go into the instructions", () => {
   assert.match(systemPrompt(req, null, "d"), /skill "truth"[\s\S]*Say what is true.\nLabel guesses./);
 });
 
+await test("gemini out of free uses: cloudflare runs the @tool", async () => {
+  const called = [];
+  const fakeFetch = async (u, o) => {
+    if (u.startsWith("https://mcp.zapier.com")) {
+      const b = JSON.parse(o.body);
+      if (b.method === "initialize") return new Response('{"jsonrpc":"2.0","id":1,"result":{}}');
+      if (!b.id) return new Response("", { status: 202 });
+      if (b.method === "tools/list") return new Response(JSON.stringify({ jsonrpc: "2.0", id: b.id, result: { tools: [{ name: "whatsapp_send", description: "Send WhatsApp", inputSchema: { type: "object", properties: { instructions: { type: "string" } } } }] } }));
+      if (b.method === "tools/call") { called.push(b.params); return new Response(JSON.stringify({ jsonrpc: "2.0", id: b.id, result: { content: [{ type: "text", text: "sent" }] } })); }
+    }
+    return new Response(JSON.stringify({ error: { message: "You exceeded your current quota" } }), { status: 429 });
+  };
+  let n = 0;
+  const env = { GEMINI_KEY: "k", ZAPIER_TOKEN: "z", AI: { run: async (m, inp) => {
+    assert.equal(inp.tools[0].function.name, "zapier__whatsapp_send");
+    return n++ === 0 ? { tool_calls: [{ name: "zapier__whatsapp_send", arguments: { instructions: "say hello" } }] } : { response: "Sent you hello on WhatsApp." };
+  } } };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: false, skills: [] }, [{ role: "user", content: "@zapier send me a whatsapp saying hello" }], env, "d", fakeFetch);
+  assert.equal(g.text, "Sent you hello on WhatsApp.");
+  assert.deepEqual(called[0], { name: "whatsapp_send", arguments: { instructions: "say hello" } });
+  assert.equal(g.sources[0].title, "Used zapier: whatsapp_send");
+});
+
 console.log(`${passed} tests passed`);
