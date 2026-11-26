@@ -358,7 +358,13 @@ export async function mcpConnect(env, doFetch = fetch) {
     const c = new McpClient(srv, doFetch);
     try {
       await c.start();
-      for (const t of (await c.tools()).slice(0, 40)) {
+      let list = await c.tools();
+      // Firecrawl has dozens of tools; Spike only needs searching and reading pages.
+      if (srv.name === "firecrawl") {
+        const keep = list.filter((t) => /^firecrawl_(search|scrape)$/.test(t.name));
+        if (keep.length) list = keep;
+      }
+      for (const t of list.slice(0, 25)) {
         const fn = safeName(`${srv.name}__${t.name}`);
         tools.push({ fn, server: srv.name, name: t.name, client: c, description: String(t.description || "").slice(0, 500), schema: t.inputSchema || { type: "object", properties: {} } });
       }
@@ -411,9 +417,12 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
   }
 
   // 0) Gemini with MCP tools (Zapier, Firecrawl, ...)
+  let mcpNote = null;
   if (req.mcp && mcpServers(env).length) {
+    const before = errs.length;
     const r = await geminiWithTools(req, contents, env, today, models, doFetch, errs);
     if (r) return r;
+    mcpNote = { title: `MCP tools didn't work: ${(errs.slice(before)[0] || "unknown").slice(0, 120)}`, link: "" };
   }
 
   // 1) Gemini with Google Search built in
@@ -423,7 +432,7 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
       (req.persona === "searcher" ? " Always search, for every question." : "");
     try {
       const r = await ask(models[0], sys, true);
-      if (r.text) return r;
+      if (r.text) return mcpNote ? { text: r.text, sources: [...r.sources, mcpNote] } : r;
       errs.push(r.err);
       if (r.status === 429 || r.status === 400) groundingOff = true;
       if (r.status === 403 || /api key/i.test(r.msg || "")) throw new Error(r.err);
@@ -445,7 +454,7 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
   for (const m of models) {
     try {
       const r = await ask(m, sys, false);
-      if (r.text) return { text: r.text, sources: (results || []).map((x) => ({ title: x.title, link: x.link })) };
+      if (r.text) return { text: r.text, sources: [...(results || []).map((x) => ({ title: x.title, link: x.link })), ...(mcpNote ? [mcpNote] : [])] };
       errs.push(r.err);
       if (r.status === 403 || (r.status === 400 && /api key/i.test(r.msg || ""))) break;
     } catch (e) { errs.push(`${m}: ${e.message}`); }
@@ -460,7 +469,7 @@ async function geminiWithTools(req, contents, env, today, models, doFetch, errs)
   if (errors.length) errs.push(...errors);
   if (!tools.length) return null;
   const sys = systemPrompt(req, null, today) +
-    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them when they help: web search/scraping for facts, Zapier for the user's apps. " +
+    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them whenever the user asks for something they can do; the user doesn't need special commands, they just ask in normal words (e.g. "send me a WhatsApp saying hi" means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
     "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. Reading and searching don't need confirmation. Don't write citation numbers.";
   const decl = tools.map((t) => ({ name: t.fn, description: `[${t.server}] ${t.description}`, parametersJsonSchema: t.schema }));
   const convo = [...contents];
