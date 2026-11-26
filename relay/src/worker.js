@@ -269,7 +269,9 @@ async function runAI(env, messages) {
 
 // ---------- Gemini (smarter, with Google Search built in) ----------
 
-const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"];
+// Free-tier models first (checked with /v1/gemini-check): the newest "flash"
+// models answer 429 (paid only) on a free key.
+const GEMINI_MODELS = ["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"];
 
 export async function gemini(req, history, env, today, doFetch = fetch) {
   const search = req.web || req.persona === "searcher";

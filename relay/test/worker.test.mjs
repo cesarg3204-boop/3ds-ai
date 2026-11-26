@@ -97,7 +97,7 @@ await test("gemini request and sources", async () => {
   let url, sent;
   const fakeFetch = async (u, o) => { url = u; sent = JSON.parse(o.body); return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "Quest chips have 18g protein." }] }, groundingMetadata: { groundingChunks: [{ web: { uri: "https://r/1", title: "questnutrition.com" } }, { web: { uri: "https://r/2", title: "questnutrition.com" } }] } }] }), { status: 200 }); };
   const g = await gemini({ persona: "chill", custom: "", project: "", web: true }, [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }, { role: "user", content: "quest chips protein" }], { GEMINI_KEY: "k" }, "d", fakeFetch);
-  assert.match(url, /gemini-3.8-flash:generateContent/);
+  assert.match(url, /gemini-3-flash-preview:generateContent/);
   assert.deepEqual(sent.contents.map((c) => c.role), ["user", "model", "user"]);
   assert.ok(sent.tools[0].google_search);
   assert.equal(g.text, "Quest chips have 18g protein.");
