@@ -301,7 +301,8 @@ export function rpcResult(bodyText, id) {
 }
 
 class McpClient {
-  constructor(server, doFetch) { this.s = server; this.f = doFetch; this.session = null; this.n = 0; }
+  // (fetch must not be called as a method: Cloudflare throws "Illegal invocation")
+  constructor(server, doFetch) { this.s = server; this.f = (...args) => doFetch(...args); this.session = null; this.n = 0; }
   headers() {
     const h = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" };
     if (this.s.token) h.Authorization = `Bearer ${this.s.token}`;
