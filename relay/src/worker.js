@@ -40,7 +40,7 @@ export function esc(s) {
 }
 
 export function parseRequest(body) {
-  const req = { persona: "chill", custom: "", project: "", web: false, messages: [] };
+  const req = { persona: "chill", custom: "", project: "", web: false, messages: [], skills: [] };
   for (const line of String(body).split("\n")) {
     const tab = line.indexOf("\t");
     if (tab < 0) continue;
@@ -50,6 +50,10 @@ export function parseRequest(body) {
     else if (k === "I") req.project = v;
     else if (k === "W") req.web = v.trim() === "1";
     else if (k === "M") req.mcp = v.trim() === "1";
+    else if (k === "Z") { // skill: Z<TAB>name<TAB>instructions
+      const t = v.indexOf("\t");
+      if (t > 0 && req.skills.length < 3) req.skills.push({ name: v.slice(0, t).trim(), text: v.slice(t + 1).slice(0, 8000) });
+    }
     else if (k === "U") req.messages.push({ role: "user", content: v, images: [] });
     else if (k === "A") req.messages.push({ role: "assistant", content: v });
     else if (req.messages.length) {
@@ -210,6 +214,9 @@ export function systemPrompt(req, results, today) {
     `Personality: ${persona}`,
   ];
   if (req.project.trim()) parts.push(`About this project (keep this in mind in every answer): ${req.project.trim()}`);
+  for (const sk of req.skills || []) {
+    parts.push(`The user started their message with /${sk.name}, which turns on the skill "${sk.name}". Follow these skill instructions for this answer (they come first, but keep the plain-text rule for the small screen):\n\n${sk.text}`);
+  }
   if (results) {
     if (results.length) {
       parts.push(`Web results found just now (searched: "${results.query || ""}"):\n\n` +
@@ -286,6 +293,13 @@ export function mcpServers(env) {
   return list;
 }
 
+// Servers the user tagged in their message, like "@zapier send me ..." or "@all".
+export function mentioned(text, servers) {
+  const tags = [...String(text || "").matchAll(/(^|[^\w@.])@([A-Za-z0-9_-]+)/g)].map((m) => m[2].toLowerCase());
+  if (tags.includes("all") || tags.includes("mcp")) return servers;
+  return servers.filter((s) => tags.includes(s.name.toLowerCase()));
+}
+
 // Reads a JSON-RPC answer that may come as plain JSON or as server-sent events.
 export function rpcResult(bodyText, id) {
   const tryOne = (t) => { try { const j = JSON.parse(t); return j && (j.id === id || j.result || j.error) ? j : null; } catch { return null; } };
@@ -351,8 +365,8 @@ class McpClient {
 const safeName = (s) => String(s).replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 60);
 
 // Connects to every server and returns their tools for Gemini.
-export async function mcpConnect(env, doFetch = fetch) {
-  const servers = mcpServers(env);
+export async function mcpConnect(env, doFetch = fetch, only = null) {
+  const servers = only || mcpServers(env);
   const tools = [], errors = [];
   await Promise.all(servers.map(async (srv) => {
     const c = new McpClient(srv, doFetch);
@@ -416,11 +430,12 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
     return { text, sources };
   }
 
-  // 0) Gemini with MCP tools (Zapier, Firecrawl, ...)
+  // 0) Gemini with MCP tools, only for servers tagged with @name in the message
   let mcpNote = null;
-  if (req.mcp && mcpServers(env).length) {
+  const tagged = mentioned(history[history.length - 1].content, mcpServers(env));
+  if (tagged.length) {
     const before = errs.length;
-    const r = await geminiWithTools(req, contents, env, today, models, doFetch, errs);
+    const r = await geminiWithTools(req, contents, env, today, models, doFetch, errs, tagged);
     if (r) return r;
     mcpNote = { title: `MCP tools didn't work: ${(errs.slice(before)[0] || "unknown").slice(0, 120)}`, link: "" };
   }
@@ -464,12 +479,12 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
 }
 
 // Lets Gemini call MCP tools: ask, run the tools it picks, give it the results, repeat.
-async function geminiWithTools(req, contents, env, today, models, doFetch, errs) {
-  const { tools, errors } = await mcpConnect(env, doFetch);
+async function geminiWithTools(req, contents, env, today, models, doFetch, errs, only) {
+  const { tools, errors } = await mcpConnect(env, doFetch, only);
   if (errors.length) errs.push(...errors);
   if (!tools.length) return null;
   const sys = systemPrompt(req, null, today) +
-    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them whenever the user asks for something they can do; the user doesn't need special commands, they just ask in normal words (e.g. asking to send yourself a WhatsApp means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
+    "\n\nThe user tagged " + [...new Set(tools.map((t) => "@" + t.server))].join(", ") + " in their message to use those connected tools. Use them for this request (e.g. asking to send yourself a WhatsApp means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
     "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. Reading and searching don't need confirmation. Don't write citation numbers.";
   const decl = tools.map((t) => ({ name: t.fn, description: `[${t.server}] ${t.description}`, parametersJsonSchema: t.schema }));
   const convo = [...contents];
@@ -584,6 +599,8 @@ export async function chat(body, env, today) {
       // daily limit reached or Gemini down: fall back to Cloudflare's own AI below
     }
   }
+  const tagged = mentioned(lastMsg.content, mcpServers(env));
+  if (tagged.length && !hasPhoto) extra.push(`S\t${esc(`@${tagged[0].name} needs Gemini, so it wasn't used this time.`)}\t`);
   if (hasPhoto) return "ERR\tPhotos need Gemini. Add a GEMINI_KEY to your relay (see the setup steps).\n";
   const force = req.persona === "searcher";
   let results = null;

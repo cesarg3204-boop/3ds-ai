@@ -21,6 +21,7 @@
 #include "stb_image.h"
 #include <dirent.h>
 #include <strings.h>
+#include <ctype.h>
 
 #define BASE "sdmc:/3ds/SpikeAI"
 #define MAX_CHATS 300
@@ -242,6 +243,116 @@ static void ensure_dirs(void)
 	mkdir(BASE, 0777);
 	mkdir(BASE "/chats", 0777);
 	mkdir(BASE "/att", 0777);
+	// first run with skills: add the starter skills (imported from Claude)
+	if (mkdir(BASE "/skills", 0777) == 0) {
+		static const char *def[][2] = {
+			{ "truth", 
+	"Honest answers: says what's true, labels guesses, doesn't just agree.\n"
+	"Tell the user what is true and what is needed, never just what is pleasant.\n"
+	"- Verdict first: lead with your honest assessment, then the reason. Praise only when it is specific and earned.\n"
+	"- Label confidence on important claims: certain, likely or guess. Never present a guess as fact.\n"
+	"- If the user pushes back, change your answer only for a new fact or a new argument, and say what changed. Insisting or annoyance is not evidence.\n"
+	"- Never invent data or quietly fill in a missing value. Never swap in an easier task without saying so.\n"
+	"- If something needed is missing, answer in this shape:\n"
+	"  Can do now: ...\n"
+	"  Can't do yet, because: ...\n"
+	"  Need from you: ...\n"
+	"- Don't say something works or is done unless it was checked; otherwise say it's unverified.\n"
+	"- Be direct about ideas, never rude to the person. Don't invent disagreement either.\n" },
+			{ "research",
+	"Deeper research: splits the question into parts and compares sources.\n"
+	"Research the user's question carefully before answering.\n"
+	"- If a key detail is ambiguous (which country, which product, which year) and it changes the answer, ask one short question first.\n"
+	"- Split the question into 2 to 4 angles (for example: facts, current status, options, outlook) and cover each one.\n"
+	"- Use the web results. Prefer official and primary sources, and recent ones. When sources disagree, say so and say which is more reliable.\n"
+	"- Give numbers, dates and names only when a source has them, and cite like [1].\n"
+	"- Shape for the small screen: a 2 to 3 sentence summary first, then a short part per angle with dashes, then \"Not sure about:\" for any gaps.\n"
+	"- Keep it under about 350 words unless the user asks for more.\n" },
+			{ "manual",
+	"Manual didáctico: explica un tema como un pequeño manual de curso.\n"
+	"Escribe la respuesta como un manual didáctico corto, en el idioma del usuario.\n"
+	"- Empieza con un título y una frase de apertura que diga para qué sirve.\n"
+	"- Divide el tema en 3 a 6 secciones numeradas (1., 2., ...). Cada sección abre con una idea guía.\n"
+	"- Usa recuadros de texto cuando ayuden: \"Punto clave:\", \"Error frecuente:\", \"Aviso:\" y \"Ejemplo:\".\n"
+	"- Usa guiones para listas y pasos numerados para procesos.\n"
+	"- Para esquemas usa texto simple, por ejemplo: Paso A -> Paso B -> Paso C.\n"
+	"- Termina con \"Resumen\" y una lista de repaso con [ ] para marcar.\n"
+	"- Verifica los datos; si no estás seguro de algo, dilo.\n"
+	"- Sin tablas ni markdown: la pantalla es pequeña.\n" },
+		};
+		for (size_t i = 0; i < sizeof def / sizeof def[0]; i++) {
+			char p[96];
+			snprintf(p, sizeof p, BASE "/skills/%s.txt", def[i][0]);
+			file_write(p, def[i][1], strlen(def[i][1]));
+		}
+	}
+}
+
+// ---------------------------------------------------------------- skills
+// A skill is a .txt file in sdmc:/3ds/SpikeAI/skills: the first line says what
+// it does, the rest is instructions. Start a message with /name to use it.
+
+#define MAX_SKILLS 40
+typedef struct { char name[32]; char desc[96]; } Skill;
+static Skill skills[MAX_SKILLS];
+static int nskills;
+
+static void load_skills(void)
+{
+	nskills = 0;
+	DIR *d = opendir(BASE "/skills");
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d)) && nskills < MAX_SKILLS) {
+		size_t L = strlen(e->d_name);
+		if (L < 5 || L > 35 || strcasecmp(e->d_name + L - 4, ".txt")) continue;
+		Skill *k = &skills[nskills++];
+		snprintf(k->name, sizeof k->name, "%.*s", (int)(L - 4), e->d_name);
+		for (char *q = k->name; *q; q++) { *q = tolower((unsigned char)*q); if (*q == ' ') *q = '-'; }
+		char p[300];
+		snprintf(p, sizeof p, BASE "/skills/%s", e->d_name);
+		k->desc[0] = 0;
+		FILE *f = fopen(p, "r");
+		if (f) {
+			if (fgets(k->desc, sizeof k->desc, f)) { char *nl = strpbrk(k->desc, "\r\n"); if (nl) *nl = 0; }
+			fclose(f);
+		}
+	}
+	closedir(d);
+	// sort by name
+	for (int i = 1; i < nskills; i++)
+		for (int j = i; j > 0 && strcmp(skills[j - 1].name, skills[j].name) > 0; j--) {
+			Skill t = skills[j]; skills[j] = skills[j - 1]; skills[j - 1] = t;
+		}
+}
+
+// The skill named at the start of a message ("/truth is this good?"), or NULL.
+// name gets the skill's name either way.
+static char *skill_for(const char *text, char *name, size_t n)
+{
+	name[0] = 0;
+	if (!text || text[0] != '/') return NULL;
+	size_t k = 0;
+	for (const char *q = text + 1; *q && !isspace((unsigned char)*q) && k + 1 < n; q++) name[k++] = tolower((unsigned char)*q);
+	name[k] = 0;
+	if (!k) return NULL;
+	DIR *d = opendir(BASE "/skills");
+	if (!d) return NULL;
+	struct dirent *e;
+	char file[300] = "";
+	while ((e = readdir(d))) {
+		size_t L = strlen(e->d_name);
+		if (L != k + 4 || strcasecmp(e->d_name + k, ".txt")) continue;
+		char low[64];
+		snprintf(low, sizeof low, "%.*s", (int)k, e->d_name);
+		for (char *q = low; *q; q++) { *q = tolower((unsigned char)*q); if (*q == ' ') *q = '-'; }
+		if (!strcmp(low, name)) { snprintf(file, sizeof file, BASE "/skills/%s", e->d_name); break; }
+	}
+	closedir(d);
+	if (!file[0]) return NULL;
+	size_t len = 0;
+	unsigned char *d2 = file_read(file, 8000, &len);
+	return (char *)d2;
 }
 
 static void cfg_line(char *ln, void *ud)
@@ -537,10 +648,10 @@ static bool kb(const char *hint, const char *initial, int maxlen, bool multiline
 
 // ---------------------------------------------------------------- app state
 
-typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS, V_FILES, V_CAMERA, V_TALK, V_MCP } View;
+typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS, V_FILES, V_CAMERA, V_TALK, V_MCP, V_SKILLS } View;
 
 static View view = V_CHAT;
-static int sel[10], scrl[10];        // list selection / first visible row per view
+static int sel[12], scrl[12];        // list selection / first visible row per view
 static int open_project;           // project shown in V_PROJECT / V_PROJEDIT
 static float chat_scroll;          // pixels up from the bottom
 static bool thinking;
@@ -617,7 +728,15 @@ static void send_chat(void)
 	Project *pr = proj_find(cur.project);
 	if (pr && pr->instr[0]) add_kv(&s, "I", pr->instr);
 	if (cfg.web) add_kv(&s, "W", "1");
-	if (cfg.mcp) add_kv(&s, "M", "1");
+	if (cur.n && cur.m[cur.n - 1].role == 'U') {
+		char nm[32];
+		char *sk = skill_for(cur.m[cur.n - 1].text, nm, sizeof nm);
+		if (sk) {
+			char *e = esc(sk);
+			s_add(&s, "Z\t"); s_add(&s, nm); s_add(&s, "\t"); s_add(&s, e); s_add(&s, "\n");
+			free(e); free(sk);
+		}
+	}
 	int start = cur.n > HISTORY ? cur.n - HISTORY : 0;
 	int last_pic = -1;
 	for (int i = start; i < cur.n; i++) if (cur.m[i].att == 'P') last_pic = i;
@@ -1158,11 +1277,11 @@ static void draw_chat_bottom(void)
 
 // ---- lists
 
-typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET, R_UP, R_DIR, R_FILE, R_MCPSET, R_MCPSRV } RowKind;
+typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET, R_UP, R_DIR, R_FILE, R_MCPSET, R_MCPSRV, R_SKILL } RowKind;
 typedef struct { RowKind kind; int ref; char title[80]; char sub[96]; } Row;
 static Row rows[MAX_CHATS + MAX_FILES + 8];
 
-enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_MCP, S_VERIFY, S_TEST, S_COUNT };
+enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_MCP, S_SKILLS, S_VERIFY, S_TEST, S_COUNT };
 enum { PS_NAME, PS_PERSONA, PS_INSTR, PS_DELETE, PS_COUNT };
 
 static void date_str(long long t, char *out, size_t n)
@@ -1225,17 +1344,14 @@ static int build_rows(View v)
 			case S_CUSTOM: copy(r->title, sizeof r->title, "Custom instructions"); copy(r->sub, sizeof r->sub, cfg.custom[0] ? cfg.custom : "Empty"); break;
 			case S_WEB: copy(r->title, sizeof r->title, "Look things up online"); yesno(cfg.web, r->sub, sizeof r->sub); break;
 			case S_VERIFY: copy(r->title, sizeof r->title, "Certificate check"); yesno(cfg.verify, r->sub, sizeof r->sub); break;
-			case S_MCP: copy(r->title, sizeof r->title, "MCP tools"); copy(r->sub, sizeof r->sub, cfg.mcp ? "On  (Zapier, Firecrawl...)" : "Off"); break;
+			case S_MCP: copy(r->title, sizeof r->title, "MCP tools  (@)"); copy(r->sub, sizeof r->sub, "Type @zapier, @firecrawl... in a message"); break;
+			case S_SKILLS: copy(r->title, sizeof r->title, "Skills  (/)"); copy(r->sub, sizeof r->sub, "Start a message with /name"); break;
 			case S_TEST: copy(r->title, sizeof r->title, "Test connection"); copy(r->sub, sizeof r->sub, ping_status[0] ? ping_status : "Checks the relay and password"); break;
 			}
 			for (char *q = r->sub; *q; q++) if (*q == '\n') *q = ' ';
 		}
 	} else if (v == V_MCP) {
 		Row *r = &rows[n++];
-		r->kind = R_MCPSET; r->ref = 0;
-		copy(r->title, sizeof r->title, "Use MCP tools");
-		yesno(cfg.mcp, r->sub, sizeof r->sub);
-		r = &rows[n++];
 		r->kind = R_MCPSET; r->ref = 1;
 		copy(r->title, sizeof r->title, "Check servers");
 		copy(r->sub, sizeof r->sub, mcp_status[0] ? mcp_status : "See what's connected to your relay");
@@ -1244,7 +1360,14 @@ static int build_rows(View v)
 			r->kind = R_MCPSRV; r->ref = i;
 			copy(r->title, sizeof r->title, mcps[i].name);
 			if (!strcmp(mcps[i].count, "ERR")) snprintf(r->sub, sizeof r->sub, "Not working: %s", mcps[i].detail);
-			else snprintf(r->sub, sizeof r->sub, "%s tools", mcps[i].count);
+			else snprintf(r->sub, sizeof r->sub, "%s tools  -  A: write @%s", mcps[i].count, mcps[i].name);
+		}
+	} else if (v == V_SKILLS) {
+		for (int i = 0; i < nskills; i++) {
+			Row *r = &rows[n++];
+			r->kind = R_SKILL; r->ref = i;
+			snprintf(r->title, sizeof r->title, "/%s", skills[i].name);
+			copy(r->sub, sizeof r->sub, skills[i].desc);
 		}
 	} else if (v == V_FILES) {
 		if (strcmp(cwd, "sdmc:/")) {
@@ -1388,7 +1511,14 @@ static void draw_bottom(void)
 		n = build_rows(V_MCP);
 		draw_bottom_header("MCP tools", NULL);
 		draw_list(V_MCP, n);
-		draw_footer("A change / check   B back");
+		draw_footer("A use it / check   B back");
+		break;
+	case V_SKILLS:
+		n = build_rows(V_SKILLS);
+		draw_bottom_header("Skills", NULL);
+		if (n) draw_list(V_SKILLS, n);
+		else text_draw_center("No skills yet", BOT_W / 2, 110, 0.47f, T.sub);
+		draw_footer("A use it   B back");
 		break;
 	case V_CAMERA:
 		draw_bottom_header("Photo", NULL);
@@ -1494,7 +1624,8 @@ static void draw_top(void)
 			break;
 		case S_WEB: body = "When on, Spike decides when to search the web and reads the actual sites before answering (products, nutrition, games, news, prices). Answers take a few seconds longer. The Searcher personality always searches."; break;
 		case S_VERIFY: body = "Checks the relay's security certificate. Leave it on. Turn it off only if the 3DS clock is wrong and you get certificate errors."; break;
-		case S_MCP: body = "MCP lets Spike use other services' tools: Firecrawl for reading websites, Zapier for your apps (Gmail, Calendar, Sheets...). Press A to see what's connected and turn it on."; break;
+		case S_MCP: body = "MCP lets Spike use other services' tools: Firecrawl for reading websites, Zapier for your apps (WhatsApp, Gmail, Calendar...). Tag one in a message, like @zapier, to use it. Press A to see what's connected."; break;
+		case S_SKILLS: body = "Skills change how Spike answers. Start a message with /name, like /truth or /research. Press A to see your skills.\n\nYour own: add .txt files to sdmc:/3ds/SpikeAI/skills"; break;
 		case S_TEST: body = ping_status[0] ? ping_status : "Press A to check that Spike can reach your relay."; break;
 		}
 		draw_text_panel("Settings", body, NULL);
@@ -1536,8 +1667,25 @@ static void draw_top(void)
 			char body[1300];
 			snprintf(body, sizeof body, "%s", strcmp(m->count, "ERR") ? m->detail : m->detail);
 			draw_text_panel(m->name, body, strcmp(m->count, "ERR") ? "Tools Spike can use:" : "This server isn't working:");
-		} else draw_text_panel("MCP tools", "Connect services in Cloudflare (worker Settings, Variables):\n- FIRECRAWL_KEY: your Firecrawl key, for reading websites\n- ZAPIER_TOKEN: token from mcp.zapier.com, for your apps\nThen turn MCP on here. Spike asks before sending or changing anything.", cfg.mcp ? "MCP is on" : "MCP is off");
+		} else draw_text_panel("MCP tools", "Tag a server in your message to use its tools:\n  @zapier send me a WhatsApp saying hi\n  @firecrawl what's on nintendo.com today?\n  @all uses every server.\nWithout an @, Spike doesn't touch your tools. Spike asks before sending or changing anything.\n\nAdd servers in Cloudflare (worker Settings, Variables): FIRECRAWL_KEY, ZAPIER_TOKEN, MCP_SERVERS.", "How to use");
 		draw_top_bar("MCP", NULL);
+		break;
+	}
+	case V_SKILLS: {
+		int n = build_rows(V_SKILLS);
+		if (n) {
+			Skill *k = &skills[rows[sel[V_SKILLS]].ref];
+			char p[300], title[40];
+			snprintf(p, sizeof p, BASE "/skills/%s.txt", k->name);
+			size_t len = 0;
+			char *t = (char *)file_read(p, 8000, &len);
+			char body[1300];
+			snprintf(body, sizeof body, "%s", t ? t : k->desc);
+			free(t);
+			snprintf(title, sizeof title, "/%s", k->name);
+			draw_text_panel(title, body, "Press A to write a message with it");
+		} else draw_text_panel("Skills", "Skills are instructions Spike follows when your message starts with /name, like /truth or /research.\n\nAdd your own: put a .txt file in sdmc:/3ds/SpikeAI/skills. The first line says what it does, the rest tells Spike how to answer.", NULL);
+		draw_top_bar("Skills", NULL);
 		break;
 	}
 	case V_CAMERA:
@@ -1652,14 +1800,14 @@ static void close_camera(void)
 	go_chat();
 }
 
-static void type_message(void);
+static void type_message(const char *pre);
 
 static void attach(char kind, const char *path)
 {
 	pend_att = kind;
 	copy(pend_path, sizeof pend_path, path);
 	go_chat();
-	type_message();
+	type_message(NULL);
 }
 
 static void snap(void)
@@ -1725,12 +1873,18 @@ static void open_chat(int id)
 	go_chat();
 }
 
-static void type_message(void)
+static void type_message(const char *pre)
 {
 	if (thinking) return;
 	if (pend_att) {
-		if (!kb(pend_att == 'P' ? "Ask about this photo (or just Send)" : "Ask about this file (or just Send)", "", 1000, true, false, "Send")) return;
-	} else if (!kb("Message Spike", "", 1000, true, true, "Send")) return;
+		if (!kb(pend_att == 'P' ? "Ask about this photo (or just Send)" : "Ask about this file (or just Send)", pre, 1000, true, false, "Send")) return;
+	} else if (!kb("Message Spike  (@tool  /skill)", pre, 1000, true, true, "Send")) return;
+	if (kbuf[0] == '/') {
+		char nm[32];
+		char *sk = skill_for(kbuf, nm, sizeof nm);
+		if (sk) free(sk);
+		else if (nm[0]) { char t[80]; snprintf(t, sizeof t, "No skill called /%s (see Settings > Skills)", nm); say(t); }
+	}
 	// first message of a new chat: create it now so the answer has a home
 	Msg *m = conv_add(&cur, 'U', kbuf);
 	if (pend_att) {
@@ -1834,9 +1988,14 @@ static void setting_change(int s, int dir)
 	case S_VERIFY: cfg.verify = !cfg.verify; net_set_verify(cfg.verify); break;
 	case S_TEST: if (!dir) send_ping(); return;
 	case S_MCP:
-		if (dir) { cfg.mcp = !cfg.mcp; break; }
+		if (dir) return;
 		view = V_MCP; sel[V_MCP] = 0;
 		if (!nmcps) send_mcp_status();
+		return;
+	case S_SKILLS:
+		if (dir) return;
+		load_skills();
+		view = V_SKILLS; sel[V_SKILLS] = 0;
 		return;
 	}
 	cfg_save();
@@ -1882,11 +2041,22 @@ static void activate_row(View v, int i)
 		load_dir();
 		break;
 	}
-	case R_MCPSET:
-		if (r->ref == 0) { cfg.mcp = !cfg.mcp; cfg_save(); say(cfg.mcp ? "MCP tools on" : "MCP tools off"); }
-		else send_mcp_status();
+	case R_MCPSET: send_mcp_status(); break;
+	case R_MCPSRV: {
+		if (!strcmp(mcps[r->ref].count, "ERR")) { say("That server isn't working right now"); break; }
+		char pre[48];
+		snprintf(pre, sizeof pre, "@%s ", mcps[r->ref].name);
+		go_chat();
+		type_message(pre);
 		break;
-	case R_MCPSRV: break;
+	}
+	case R_SKILL: {
+		char pre[48];
+		snprintf(pre, sizeof pre, "/%s ", skills[r->ref].name);
+		go_chat();
+		type_message(pre);
+		break;
+	}
 	case R_FILE: {
 		char p[300];
 		file_path(r->ref, p, sizeof p);
@@ -1906,7 +2076,7 @@ static void back(void)
 	case V_FILES: if (strcmp(cwd, "sdmc:/")) dir_up(); else go_chat(); break;
 	case V_CAMERA: close_camera(); break;
 	case V_TALK: cancel_talk(); break;
-	case V_MCP: view = V_SETTINGS; break;
+	case V_MCP: case V_SKILLS: view = V_SETTINGS; break;
 	default: go_chat(); break;
 	}
 }
@@ -1933,7 +2103,7 @@ static void do_action(int a)
 		return;
 	}
 	switch (a) {
-	case A_TYPE: type_message(); break;
+	case A_TYPE: type_message(NULL); break;
 	case A_RETRY: retry(); break;
 	case A_CHATS: view = V_CHATS; break;
 	case A_NEW: new_chat(cur.project); say("New chat"); break;
@@ -1970,7 +2140,7 @@ static void handle_keys(u32 down, u32 held)
 		return;
 	}
 	if (view == V_CHAT) {
-		if (down & KEY_A) { if (chat_err[0] && !thinking) retry(); else type_message(); }
+		if (down & KEY_A) { if (chat_err[0] && !thinking) retry(); else type_message(NULL); }
 		if (down & KEY_R) start_talk();
 		if (down & KEY_DLEFT) open_camera();
 		if (down & KEY_DRIGHT) open_files();
@@ -2002,13 +2172,13 @@ static void handle_keys(u32 down, u32 held)
 	fix_scroll(view, n);
 	int i = sel[view];
 	if (down & KEY_A) activate_row(view, i);
-	else if (down & KEY_X && view != V_FILES && view != V_MCP) rename_row(&rows[i]);
-	else if (down & KEY_Y && view != V_FILES && view != V_MCP) delete_row(view, i);
+	else if (down & KEY_X && view != V_FILES && view != V_MCP && view != V_SKILLS) rename_row(&rows[i]);
+	else if (down & KEY_Y && view != V_FILES && view != V_MCP && view != V_SKILLS) delete_row(view, i);
 	else if (down & KEY_B) back();
 	else if (down & (KEY_L | KEY_R) && (view == V_CHATS || view == V_PROJECTS)) { view = view == V_CHATS ? V_PROJECTS : V_CHATS; armed = -1; }
 	else if (down & (KEY_DLEFT | KEY_DRIGHT)) {
 		int dir = down & KEY_DLEFT ? -1 : 1;
-		if (view == V_SETTINGS && (rows[i].ref == S_PERSONA || rows[i].ref == S_WEB || rows[i].ref == S_VERIFY || rows[i].ref == S_MCP)) setting_change(rows[i].ref, dir);
+		if (view == V_SETTINGS && (rows[i].ref == S_PERSONA || rows[i].ref == S_WEB || rows[i].ref == S_VERIFY)) setting_change(rows[i].ref, dir);
 		if (view == V_PROJEDIT && rows[i].ref == PS_PERSONA) projset_change(PS_PERSONA, dir);
 	} else if (down & KEY_SELECT) {
 		if (view == V_PROJECT) do_action(A_EDITPROJ);

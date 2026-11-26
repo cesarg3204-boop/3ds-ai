@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding, rpcResult, mcpServers } from "../src/worker.js";
+import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding, rpcResult, mcpServers, mentioned } from "../src/worker.js";
 
 let passed = 0;
 async function test(name, fn) { try { await fn(); passed++; console.log("ok -", name); } catch (e) { console.log("FAIL -", name); console.log(e); process.exitCode = 1; } }
@@ -194,10 +194,33 @@ await test("gemini calls an MCP tool and answers with the result", async () => {
     assert.equal(b.tools[0].functionDeclarations[0].name, "firecrawl__firecrawl_search");
     return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: "firecrawl__firecrawl_search", args: { query: "quest chips protein" } }, thoughtSignature: "x" }] } }] }));
   };
-  const g = await gemini({ persona: "chill", custom: "", project: "", web: false, mcp: true }, [{ role: "user", content: "quest chips protein?" }], { GEMINI_KEY: "k", FIRECRAWL_KEY: "fc" }, "d", fakeFetch);
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: false, mcp: true }, [{ role: "user", content: "@firecrawl quest chips protein?" }], { GEMINI_KEY: "k", FIRECRAWL_KEY: "fc" }, "d", fakeFetch);
   assert.equal(g.text, "19g of protein.");
   assert.deepEqual(seen[0], { name: "firecrawl_search", arguments: { query: "quest chips protein" } });
   assert.equal(g.sources[0].title, "Used firecrawl: firecrawl_search");
+});
+
+await test("@ tags pick MCP servers", () => {
+  const srv = mcpServers({ FIRECRAWL_KEY: "f", ZAPIER_TOKEN: "z" });
+  assert.deepEqual(mentioned("@zapier send me a whatsapp", srv).map((s) => s.name), ["zapier"]);
+  assert.deepEqual(mentioned("hey @Firecrawl and @zapier", srv).map((s) => s.name), ["firecrawl", "zapier"]);
+  assert.equal(mentioned("mail me at bob@zapier.com", srv).length, 0);
+  assert.equal(mentioned("no tags here", srv).length, 0);
+  assert.equal(mentioned("@all what's new", srv).length, 2);
+});
+
+await test("no @ means no MCP tools", async () => {
+  const urls = [];
+  const fakeFetch = async (u) => { urls.push(u); return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "hi" }] } }] })); };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: false, mcp: true, skills: [] }, [{ role: "user", content: "hello" }], { GEMINI_KEY: "k", ZAPIER_TOKEN: "z" }, "d", fakeFetch);
+  assert.equal(g.text, "hi");
+  assert.ok(!urls.some((u) => u.includes("zapier")));
+});
+
+await test("skills go into the instructions", () => {
+  const req = parseRequest("Z\ttruth\tSay what is true.\\nLabel guesses.\nU\t/truth is this good?\n");
+  assert.equal(req.skills[0].name, "truth");
+  assert.match(systemPrompt(req, null, "d"), /skill "truth"[\s\S]*Say what is true.\nLabel guesses./);
 });
 
 console.log(`${passed} tests passed`);

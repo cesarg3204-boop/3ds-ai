@@ -21,7 +21,11 @@ Spike can use tools from MCP servers through the relay. Add these as variables (
 - `ZAPIER_TOKEN`: a connection token from mcp.zapier.com (New MCP Server, Other client, add tools, Connect, generate token), for your apps.
 - `MCP_SERVERS`: any other servers, one per line: `name https://url [token]`.
 
-Then in the app: Settings, MCP tools, Check servers, and turn on Use MCP tools. Spike asks before sending or changing anything.
+To use a server, tag it in your message: `@zapier send me a WhatsApp saying hi`, `@firecrawl what's on nintendo.com?`, or `@all` for every server. Without an `@`, Spike doesn't use your tools. Settings, MCP tools shows what's connected (tap a server to start a message with its tag). Spike asks before sending or changing anything.
+
+## Skills
+
+Start a message with `/name` to use a skill, like `/truth is my plan good?`. Skills are .txt files in `sdmc:/3ds/SpikeAI/skills`: the first line says what the skill does, the rest is instructions Spike follows. The app adds three starter skills, adapted from Claude skills: `/truth` (honest answers, labels guesses), `/research` (deeper research across sources) and `/manual` (explains a topic like a short course manual, in Spanish style). Settings, Skills lists them; tap one to start a message with it.
 
 ## Set up the app
 
