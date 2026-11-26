@@ -140,6 +140,7 @@ typedef struct {
 	char custom[1200];
 	bool web;
 	bool verify;
+	bool mcp;
 	int last_chat;
 } Config;
 
@@ -255,6 +256,7 @@ static void cfg_line(char *ln, void *ud)
 	else if (!strcmp(ln, "persona")) cfg.persona = atoi(v);
 	else if (!strcmp(ln, "custom")) copy(cfg.custom, sizeof cfg.custom, v);
 	else if (!strcmp(ln, "web")) cfg.web = atoi(v) != 0;
+	else if (!strcmp(ln, "mcp")) cfg.mcp = atoi(v) != 0;
 	else if (!strcmp(ln, "verify")) cfg.verify = atoi(v) != 0;
 	else if (!strcmp(ln, "last")) cfg.last_chat = atoi(v);
 }
@@ -286,7 +288,7 @@ static void cfg_save(void)
 	FILE *f = fopen(BASE "/config.txt", "wb");
 	if (!f) return;
 	char *a = esc(cfg.relay), *b = esc(cfg.key), *c = esc(cfg.custom);
-	fprintf(f, "relay=%s\nkey=%s\npersona=%d\ncustom=%s\nweb=%d\nverify=%d\nlast=%d\n", a, b, cfg.persona, c, cfg.web, cfg.verify, cfg.last_chat);
+	fprintf(f, "relay=%s\nkey=%s\npersona=%d\ncustom=%s\nweb=%d\nverify=%d\nlast=%d\nmcp=%d\n", a, b, cfg.persona, c, cfg.web, cfg.verify, cfg.last_chat, cfg.mcp);
 	free(a); free(b); free(c);
 	fclose(f);
 }
@@ -535,7 +537,7 @@ static bool kb(const char *hint, const char *initial, int maxlen, bool multiline
 
 // ---------------------------------------------------------------- app state
 
-typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS, V_FILES, V_CAMERA, V_TALK } View;
+typedef enum { V_CHAT, V_CHATS, V_PROJECTS, V_PROJECT, V_PROJEDIT, V_SETTINGS, V_FILES, V_CAMERA, V_TALK, V_MCP } View;
 
 static View view = V_CHAT;
 static int sel[10], scrl[10];        // list selection / first visible row per view
@@ -584,7 +586,13 @@ static void relay_url(char *out, size_t n, const char *path)
 	snprintf(out, n, "%s%s", base, path);
 }
 
-enum { TAG_CHAT = 1, TAG_PING };
+enum { TAG_CHAT = 1, TAG_PING, TAG_MCP };
+
+// MCP servers the relay is connected to (from /v1/mcp)
+typedef struct { char name[40]; char count[12]; char detail[1200]; } McpSrv;
+static McpSrv mcps[10];
+static int nmcps;
+static char mcp_status[160];
 
 static void add_kv(Str *s, const char *k, const char *v)
 {
@@ -609,6 +617,7 @@ static void send_chat(void)
 	Project *pr = proj_find(cur.project);
 	if (pr && pr->instr[0]) add_kv(&s, "I", pr->instr);
 	if (cfg.web) add_kv(&s, "W", "1");
+	if (cfg.mcp) add_kv(&s, "M", "1");
 	int start = cur.n > HISTORY ? cur.n - HISTORY : 0;
 	int last_pic = -1;
 	for (int i = start; i < cur.n; i++) if (cur.m[i].att == 'P') last_pic = i;
@@ -741,6 +750,46 @@ static void got_chat(Job *j)
 		say("Spike answered in another chat.");
 	}
 	if (preview.id == id) preview.id = -1; // reload
+}
+
+static void send_mcp_status(void)
+{
+	if (!cfg.relay[0]) { copy(mcp_status, sizeof mcp_status, "Add the relay address in Settings first."); return; }
+	char url[260];
+	relay_url(url, sizeof url, "/v1/mcp");
+	Job *j = job_new(JOB_TEXT, TAG_MCP, url);
+	j->timeout = 60;
+	net_submit(j, true);
+	copy(mcp_status, sizeof mcp_status, "Checking your MCP servers...");
+}
+
+static void got_mcp(Job *j)
+{
+	nmcps = 0;
+	if (!j->ok) { snprintf(mcp_status, sizeof mcp_status, "Can't reach the relay: %s", j->err); return; }
+	if (strncmp(j->body, "OK", 2)) {
+		char *e = j->body;
+		if (!strncmp(e, "ERR\t", 4)) e += 4;
+		char *nl = strchr(e, '\n');
+		if (nl) *nl = 0;
+		snprintf(mcp_status, sizeof mcp_status, "%s", strncmp(j->body, "ERR", 3) ? "Update your relay code to use MCP." : unesc(e));
+		return;
+	}
+	char *p = j->body;
+	while (p && *p && nmcps < 10) {
+		char *nl = strchr(p, '\n');
+		if (nl) *nl = 0;
+		if (!strncmp(p, "S\t", 2)) {
+			char *name = p + 2, *cnt = cut(name), *det = cut(cnt);
+			McpSrv *m = &mcps[nmcps++];
+			copy(m->name, sizeof m->name, unesc(name));
+			copy(m->count, sizeof m->count, cnt);
+			copy(m->detail, sizeof m->detail, unesc(det));
+		}
+		p = nl ? nl + 1 : NULL;
+	}
+	if (!nmcps) copy(mcp_status, sizeof mcp_status, "No MCP servers on your relay yet. Add FIRECRAWL_KEY or ZAPIER_TOKEN in Cloudflare.");
+	else snprintf(mcp_status, sizeof mcp_status, "%d server%s connected.", nmcps, nmcps == 1 ? "" : "s");
 }
 
 static void got_ping(Job *j)
@@ -1109,11 +1158,11 @@ static void draw_chat_bottom(void)
 
 // ---- lists
 
-typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET, R_UP, R_DIR, R_FILE } RowKind;
+typedef enum { R_NEWCHAT, R_CHAT, R_NEWPROJ, R_PROJ, R_SET, R_PSET, R_UP, R_DIR, R_FILE, R_MCPSET, R_MCPSRV } RowKind;
 typedef struct { RowKind kind; int ref; char title[80]; char sub[96]; } Row;
 static Row rows[MAX_CHATS + MAX_FILES + 8];
 
-enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_VERIFY, S_TEST, S_COUNT };
+enum { S_RELAY, S_PERSONA, S_CUSTOM, S_WEB, S_MCP, S_VERIFY, S_TEST, S_COUNT };
 enum { PS_NAME, PS_PERSONA, PS_INSTR, PS_DELETE, PS_COUNT };
 
 static void date_str(long long t, char *out, size_t n)
@@ -1176,9 +1225,26 @@ static int build_rows(View v)
 			case S_CUSTOM: copy(r->title, sizeof r->title, "Custom instructions"); copy(r->sub, sizeof r->sub, cfg.custom[0] ? cfg.custom : "Empty"); break;
 			case S_WEB: copy(r->title, sizeof r->title, "Look things up online"); yesno(cfg.web, r->sub, sizeof r->sub); break;
 			case S_VERIFY: copy(r->title, sizeof r->title, "Certificate check"); yesno(cfg.verify, r->sub, sizeof r->sub); break;
+			case S_MCP: copy(r->title, sizeof r->title, "MCP tools"); copy(r->sub, sizeof r->sub, cfg.mcp ? "On  (Zapier, Firecrawl...)" : "Off"); break;
 			case S_TEST: copy(r->title, sizeof r->title, "Test connection"); copy(r->sub, sizeof r->sub, ping_status[0] ? ping_status : "Checks the relay and password"); break;
 			}
 			for (char *q = r->sub; *q; q++) if (*q == '\n') *q = ' ';
+		}
+	} else if (v == V_MCP) {
+		Row *r = &rows[n++];
+		r->kind = R_MCPSET; r->ref = 0;
+		copy(r->title, sizeof r->title, "Use MCP tools");
+		yesno(cfg.mcp, r->sub, sizeof r->sub);
+		r = &rows[n++];
+		r->kind = R_MCPSET; r->ref = 1;
+		copy(r->title, sizeof r->title, "Check servers");
+		copy(r->sub, sizeof r->sub, mcp_status[0] ? mcp_status : "See what's connected to your relay");
+		for (int i = 0; i < nmcps; i++) {
+			r = &rows[n++];
+			r->kind = R_MCPSRV; r->ref = i;
+			copy(r->title, sizeof r->title, mcps[i].name);
+			if (!strcmp(mcps[i].count, "ERR")) snprintf(r->sub, sizeof r->sub, "Not working: %s", mcps[i].detail);
+			else snprintf(r->sub, sizeof r->sub, "%s tools", mcps[i].count);
 		}
 	} else if (v == V_FILES) {
 		if (strcmp(cwd, "sdmc:/")) {
@@ -1318,6 +1384,12 @@ static void draw_bottom(void)
 		draw_footer("A open / pick   B back   (JPG, PNG, TXT)");
 		break;
 	}
+	case V_MCP:
+		n = build_rows(V_MCP);
+		draw_bottom_header("MCP tools", NULL);
+		draw_list(V_MCP, n);
+		draw_footer("A change / check   B back");
+		break;
 	case V_CAMERA:
 		draw_bottom_header("Photo", NULL);
 		button(12, 42, 296, 80, "Snap", "A", A_SNAP, 1);
@@ -1422,6 +1494,7 @@ static void draw_top(void)
 			break;
 		case S_WEB: body = "When on, Spike decides when to search the web and reads the actual sites before answering (products, nutrition, games, news, prices). Answers take a few seconds longer. The Searcher personality always searches."; break;
 		case S_VERIFY: body = "Checks the relay's security certificate. Leave it on. Turn it off only if the 3DS clock is wrong and you get certificate errors."; break;
+		case S_MCP: body = "MCP lets Spike use other services' tools: Firecrawl for reading websites, Zapier for your apps (Gmail, Calendar, Sheets...). Press A to see what's connected and turn it on."; break;
 		case S_TEST: body = ping_status[0] ? ping_status : "Press A to check that Spike can reach your relay."; break;
 		}
 		draw_text_panel("Settings", body, NULL);
@@ -1453,6 +1526,18 @@ static void draw_top(void)
 			}
 		} else draw_text_panel("Attach a file", "Pick a JPG or PNG picture, or a .txt file, from your SD card. Spike can look at pictures and read text files. Your 3DS photos are in the DCIM folder.", NULL);
 		draw_top_bar("SD card", NULL);
+		break;
+	}
+	case V_MCP: {
+		int n = build_rows(V_MCP);
+		Row *r = n ? &rows[sel[V_MCP]] : NULL;
+		if (r && r->kind == R_MCPSRV) {
+			McpSrv *m = &mcps[r->ref];
+			char body[1300];
+			snprintf(body, sizeof body, "%s", strcmp(m->count, "ERR") ? m->detail : m->detail);
+			draw_text_panel(m->name, body, strcmp(m->count, "ERR") ? "Tools Spike can use:" : "This server isn't working:");
+		} else draw_text_panel("MCP tools", "Connect services in Cloudflare (worker Settings, Variables):\n- FIRECRAWL_KEY: your Firecrawl key, for reading websites\n- ZAPIER_TOKEN: token from mcp.zapier.com, for your apps\nThen turn MCP on here. Spike asks before sending or changing anything.", cfg.mcp ? "MCP is on" : "MCP is off");
+		draw_top_bar("MCP", NULL);
 		break;
 	}
 	case V_CAMERA:
@@ -1748,6 +1833,11 @@ static void setting_change(int s, int dir)
 	case S_WEB: cfg.web = !cfg.web; break;
 	case S_VERIFY: cfg.verify = !cfg.verify; net_set_verify(cfg.verify); break;
 	case S_TEST: if (!dir) send_ping(); return;
+	case S_MCP:
+		if (dir) { cfg.mcp = !cfg.mcp; break; }
+		view = V_MCP; sel[V_MCP] = 0;
+		if (!nmcps) send_mcp_status();
+		return;
 	}
 	cfg_save();
 }
@@ -1792,6 +1882,11 @@ static void activate_row(View v, int i)
 		load_dir();
 		break;
 	}
+	case R_MCPSET:
+		if (r->ref == 0) { cfg.mcp = !cfg.mcp; cfg_save(); say(cfg.mcp ? "MCP tools on" : "MCP tools off"); }
+		else send_mcp_status();
+		break;
+	case R_MCPSRV: break;
 	case R_FILE: {
 		char p[300];
 		file_path(r->ref, p, sizeof p);
@@ -1811,6 +1906,7 @@ static void back(void)
 	case V_FILES: if (strcmp(cwd, "sdmc:/")) dir_up(); else go_chat(); break;
 	case V_CAMERA: close_camera(); break;
 	case V_TALK: cancel_talk(); break;
+	case V_MCP: view = V_SETTINGS; break;
 	default: go_chat(); break;
 	}
 }
@@ -1906,13 +2002,13 @@ static void handle_keys(u32 down, u32 held)
 	fix_scroll(view, n);
 	int i = sel[view];
 	if (down & KEY_A) activate_row(view, i);
-	else if (down & KEY_X && view != V_FILES) rename_row(&rows[i]);
-	else if (down & KEY_Y && view != V_FILES) delete_row(view, i);
+	else if (down & KEY_X && view != V_FILES && view != V_MCP) rename_row(&rows[i]);
+	else if (down & KEY_Y && view != V_FILES && view != V_MCP) delete_row(view, i);
 	else if (down & KEY_B) back();
 	else if (down & (KEY_L | KEY_R) && (view == V_CHATS || view == V_PROJECTS)) { view = view == V_CHATS ? V_PROJECTS : V_CHATS; armed = -1; }
 	else if (down & (KEY_DLEFT | KEY_DRIGHT)) {
 		int dir = down & KEY_DLEFT ? -1 : 1;
-		if (view == V_SETTINGS && (rows[i].ref == S_PERSONA || rows[i].ref == S_WEB || rows[i].ref == S_VERIFY)) setting_change(rows[i].ref, dir);
+		if (view == V_SETTINGS && (rows[i].ref == S_PERSONA || rows[i].ref == S_WEB || rows[i].ref == S_VERIFY || rows[i].ref == S_MCP)) setting_change(rows[i].ref, dir);
 		if (view == V_PROJEDIT && rows[i].ref == PS_PERSONA) projset_change(PS_PERSONA, dir);
 	} else if (down & KEY_SELECT) {
 		if (view == V_PROJECT) do_action(A_EDITPROJ);
@@ -1959,6 +2055,7 @@ int main(void)
 		while ((j = net_poll())) {
 			if (j->tag == TAG_CHAT) got_chat(j);
 			else if (j->tag == TAG_PING) got_ping(j);
+			else if (j->tag == TAG_MCP) got_mcp(j);
 			job_free(j);
 		}
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding } from "../src/worker.js";
+import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding, rpcResult, mcpServers } from "../src/worker.js";
 
 let passed = 0;
 async function test(name, fn) { try { await fn(); passed++; console.log("ok -", name); } catch (e) { console.log("FAIL -", name); console.log(e); process.exitCode = 1; } }
@@ -160,6 +160,44 @@ await test("google search quota: falls back to our own search", async () => {
   await gemini({ persona: "chill", custom: "", project: "", web: true }, [{ role: "user", content: "x" }], env, "d", fakeFetch, lookup);
   assert.deepEqual(calls, [false]);
   resetGrounding();
+});
+
+await test("rpc answers can be SSE", () => {
+  assert.equal(rpcResult('event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n', 2).result.tools.length, 0);
+  assert.equal(rpcResult('{"jsonrpc":"2.0","id":1,"result":{}}', 1).id, 1);
+});
+
+await test("mcp servers from variables", () => {
+  const s = mcpServers({ FIRECRAWL_KEY: " fc-1 ", ZAPIER_TOKEN: "z", MCP_SERVERS: "wiki https://w.example/mcp tok\nbad notaurl" });
+  assert.deepEqual(s.map((x) => x.name), ["firecrawl", "zapier", "wiki"]);
+  assert.equal(s[0].url, "https://mcp.firecrawl.dev/fc-1/v2/mcp");
+  assert.equal(s[1].token, "z");
+});
+
+await test("gemini calls an MCP tool and answers with the result", async () => {
+  const seen = [];
+  const fakeFetch = async (u, o) => {
+    const b = JSON.parse(o.body);
+    if (u.startsWith("https://mcp.firecrawl.dev")) {
+      if (b.method === "initialize") return new Response('{"jsonrpc":"2.0","id":1,"result":{}}', { headers: { "Mcp-Session-Id": "s1" } });
+      if (!b.id) return new Response("", { status: 202 });
+      assert.equal(o.headers["Mcp-Session-Id"], "s1");
+      if (b.method === "tools/list") return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: b.id, result: { tools: [{ name: "firecrawl_search", description: "Search", inputSchema: { type: "object", properties: { query: { type: "string" } } } }] } })}\n\n`);
+      if (b.method === "tools/call") { seen.push(b.params); return new Response(JSON.stringify({ jsonrpc: "2.0", id: b.id, result: { content: [{ type: "text", text: "Quest chips: 19g protein" }] } })); }
+    }
+    // Gemini
+    const last = b.contents[b.contents.length - 1];
+    if (last.parts[0].functionResponse) {
+      assert.match(last.parts[0].functionResponse.response.result, /19g/);
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "19g of protein." }] } }] }));
+    }
+    assert.equal(b.tools[0].functionDeclarations[0].name, "firecrawl__firecrawl_search");
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: "firecrawl__firecrawl_search", args: { query: "quest chips protein" } }, thoughtSignature: "x" }] } }] }));
+  };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: false, mcp: true }, [{ role: "user", content: "quest chips protein?" }], { GEMINI_KEY: "k", FIRECRAWL_KEY: "fc" }, "d", fakeFetch);
+  assert.equal(g.text, "19g of protein.");
+  assert.deepEqual(seen[0], { name: "firecrawl_search", arguments: { query: "quest chips protein" } });
+  assert.equal(g.sources[0].title, "Used firecrawl: firecrawl_search");
 });
 
 console.log(`${passed} tests passed`);

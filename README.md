@@ -13,6 +13,16 @@ A chat assistant for the Nintendo 3DS, with a little blue sprout named Spike.
 4. (Smarter Spike, free) Get an API key at aistudio.google.com (Get API key, Create API key). In the worker's **Settings**, **Variables and Secrets**, add a **Secret** named `GEMINI_KEY` with that key. Spike then uses Gemini with Google Search, and falls back to Cloudflare's AI if Gemini's daily limit runs out.
 5. Open `https://spike-ai.<your-subdomain>.workers.dev/v1/ping` in a browser. It should say `SPIKE OK  ai`.
 
+## MCP tools (optional)
+
+Spike can use tools from MCP servers through the relay. Add these as variables (or secrets) in the worker's Settings:
+
+- `FIRECRAWL_KEY`: your Firecrawl API key (fc-...) from firecrawl.dev, for searching and reading websites.
+- `ZAPIER_TOKEN`: a connection token from mcp.zapier.com (New MCP Server, Other client, add tools, Connect, generate token), for your apps.
+- `MCP_SERVERS`: any other servers, one per line: `name https://url [token]`.
+
+Then in the app: Settings, MCP tools, Check servers, and turn on Use MCP tools. Spike asks before sending or changing anything.
+
 ## Set up the app
 
 1. Copy `SpikeAI.3dsx` to `sdmc:/3ds/` and open it from the Homebrew Launcher.

@@ -49,6 +49,7 @@ export function parseRequest(body) {
     else if (k === "C") req.custom = v;
     else if (k === "I") req.project = v;
     else if (k === "W") req.web = v.trim() === "1";
+    else if (k === "M") req.mcp = v.trim() === "1";
     else if (k === "U") req.messages.push({ role: "user", content: v, images: [] });
     else if (k === "A") req.messages.push({ role: "assistant", content: v });
     else if (req.messages.length) {
@@ -267,6 +268,104 @@ async function runAI(env, messages) {
   throw last || new Error("no model answered");
 }
 
+// ---------- MCP (tools from other services, e.g. Zapier, Firecrawl) ----------
+//
+// Servers come from Cloudflare variables:
+//   FIRECRAWL_KEY   your Firecrawl API key (fc-...)
+//   ZAPIER_TOKEN    a connection token from mcp.zapier.com
+//   MCP_SERVERS     more servers, one per line: name url [token]
+
+export function mcpServers(env) {
+  const list = [];
+  if (env.FIRECRAWL_KEY) list.push({ name: "firecrawl", url: `https://mcp.firecrawl.dev/${String(env.FIRECRAWL_KEY).trim()}/v2/mcp` });
+  if (env.ZAPIER_TOKEN) list.push({ name: "zapier", url: "https://mcp.zapier.com/api/v1/connect", token: String(env.ZAPIER_TOKEN).trim() });
+  for (const line of String(env.MCP_SERVERS || "").split("\n")) {
+    const [name, url, token] = line.trim().split(/\s+/);
+    if (name && /^https:\/\//.test(url || "")) list.push({ name, url, token });
+  }
+  return list;
+}
+
+// Reads a JSON-RPC answer that may come as plain JSON or as server-sent events.
+export function rpcResult(bodyText, id) {
+  const tryOne = (t) => { try { const j = JSON.parse(t); return j && (j.id === id || j.result || j.error) ? j : null; } catch { return null; } };
+  const direct = tryOne(bodyText.trim());
+  if (direct) return direct;
+  let found = null;
+  for (const block of bodyText.split(/\r?\n\r?\n/)) {
+    const data = block.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n");
+    const j = data && tryOne(data);
+    if (j && j.id === id) found = j;
+  }
+  return found;
+}
+
+class McpClient {
+  constructor(server, doFetch) { this.s = server; this.f = doFetch; this.session = null; this.n = 0; }
+  headers() {
+    const h = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" };
+    if (this.s.token) h.Authorization = `Bearer ${this.s.token}`;
+    if (this.session) h["Mcp-Session-Id"] = this.session;
+    return h;
+  }
+  async rpc(method, params, notify = false) {
+    const id = notify ? undefined : ++this.n;
+    const res = await this.f(this.s.url, {
+      method: "POST", headers: this.headers(),
+      body: JSON.stringify(notify ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params }),
+      signal: AbortSignal.timeout(25000),
+    });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) this.session = sid;
+    const t = await res.text();
+    if (notify) return null;
+    if (!res.ok) throw new Error(`${this.s.name} ${res.status} ${t.slice(0, 80)}`);
+    const j = rpcResult(t, id);
+    if (!j) throw new Error(`${this.s.name}: unreadable answer`);
+    if (j.error) throw new Error(`${this.s.name}: ${j.error.message || "error"}`);
+    return j.result;
+  }
+  async start() {
+    await this.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "spike-ai", version: "1.0" } });
+    await this.rpc("notifications/initialized", {}, true).catch(() => {});
+  }
+  async tools() {
+    const out = [];
+    let cursor;
+    for (let i = 0; i < 5; i++) {
+      const r = await this.rpc("tools/list", cursor ? { cursor } : {});
+      out.push(...(r.tools || []));
+      cursor = r.nextCursor;
+      if (!cursor) break;
+    }
+    return out;
+  }
+  async call(name, args) {
+    const r = await this.rpc("tools/call", { name, arguments: args || {} });
+    const text = (r.content || []).map((c) => c.type === "text" ? c.text : c.type === "resource" ? (c.resource?.text || "") : `[${c.type}]`).join("\n");
+    return { error: !!r.isError, text: (text || JSON.stringify(r.structuredContent || {})).slice(0, 9000) };
+  }
+}
+
+const safeName = (s) => String(s).replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 60);
+
+// Connects to every server and returns their tools for Gemini.
+export async function mcpConnect(env, doFetch = fetch) {
+  const servers = mcpServers(env);
+  const tools = [], errors = [];
+  await Promise.all(servers.map(async (srv) => {
+    const c = new McpClient(srv, doFetch);
+    try {
+      await c.start();
+      for (const t of (await c.tools()).slice(0, 40)) {
+        const fn = safeName(`${srv.name}__${t.name}`);
+        tools.push({ fn, server: srv.name, name: t.name, client: c, description: String(t.description || "").slice(0, 500), schema: t.inputSchema || { type: "object", properties: {} } });
+      }
+    } catch (e) { errors.push(`${srv.name}: ${e.message}`.slice(0, 120)); }
+  }));
+  return { tools, errors, servers };
+}
+
 // ---------- Gemini (smarter, with Google Search built in) ----------
 
 // Free-tier models first (checked with /v1/gemini-check): the newest "flash"
@@ -310,6 +409,12 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
     return { text, sources };
   }
 
+  // 0) Gemini with MCP tools (Zapier, Firecrawl, ...)
+  if (req.mcp && mcpServers(env).length) {
+    const r = await geminiWithTools(req, contents, env, today, models, doFetch, errs);
+    if (r) return r;
+  }
+
   // 1) Gemini with Google Search built in
   if (search && !groundingOff) {
     const sys = systemPrompt(req, null, today) +
@@ -346,6 +451,70 @@ export async function gemini(req, history, env, today, doFetch = fetch, lookup =
   }
   // the first error is usually the telling one (later models are just fallbacks)
   throw new Error(`Gemini didn't answer. ${errs.slice(-2).join(" | ")}`.slice(0, 230));
+}
+
+// Lets Gemini call MCP tools: ask, run the tools it picks, give it the results, repeat.
+async function geminiWithTools(req, contents, env, today, models, doFetch, errs) {
+  const { tools, errors } = await mcpConnect(env, doFetch);
+  if (errors.length) errs.push(...errors);
+  if (!tools.length) return null;
+  const sys = systemPrompt(req, null, today) +
+    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them when they help: web search/scraping for facts, Zapier for the user's apps. " +
+    "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. Reading and searching don't need confirmation. Don't write citation numbers.";
+  const decl = tools.map((t) => ({ name: t.fn, description: `[${t.server}] ${t.description}`, parametersJsonSchema: t.schema }));
+  const convo = [...contents];
+  const used = [];
+  for (const m of models.slice(0, 3)) {
+    try {
+      for (let round = 0; round < 5; round++) {
+        const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
+          body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: convo, tools: [{ functionDeclarations: decl }], generationConfig: { maxOutputTokens: 2048, temperature: 0.4 } }),
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) { errs.push(`${m}+tools: ${res.status} ${(j.error?.message || "").slice(0, 90)}`); break; }
+        const parts = j.candidates?.[0]?.content?.parts || [];
+        const calls = parts.filter((p) => p.functionCall);
+        if (!calls.length) {
+          const text = parts.map((p) => p.text || "").join("");
+          if (text.trim()) return { text, sources: used.map((u) => ({ title: `Used ${u}`, link: "" })) };
+          errs.push(`${m}+tools: empty answer`);
+          break;
+        }
+        convo.push({ role: "model", parts });
+        const answers = await Promise.all(calls.map(async ({ functionCall: fc }) => {
+          const t = tools.find((x) => x.fn === fc.name);
+          let response;
+          if (!t) response = { error: "unknown tool" };
+          else {
+            used.push(`${t.server}: ${t.name}`);
+            try { const r = await t.client.call(t.name, fc.args); response = r.error ? { error: r.text } : { result: r.text }; }
+            catch (e) { response = { error: e.message }; }
+          }
+          return { functionResponse: { name: fc.name, response } };
+        }));
+        convo.push({ role: "user", parts: answers });
+      }
+    } catch (e) { errs.push(`${m}+tools: ${e.message}`); }
+    convo.length = contents.length; // start over with the next model
+    used.length = 0;
+  }
+  return null;
+}
+
+// For the app's MCP screen: which servers are set up and what tools they have.
+export async function mcpStatus(env, doFetch = fetch) {
+  const servers = mcpServers(env);
+  if (!servers.length) return "OK\n";
+  const { tools, errors } = await mcpConnect(env, doFetch);
+  const lines = ["OK"];
+  for (const srv of servers) {
+    const mine = tools.filter((t) => t.server === srv.name);
+    const err = errors.find((e) => e.startsWith(srv.name + ":"));
+    lines.push(`S\t${esc(srv.name)}\t${err ? "ERR" : mine.length}\t${esc(err ? err.slice(srv.name.length + 2) : mine.map((t) => t.name).join(", "))}`);
+  }
+  return lines.join("\n") + "\n";
 }
 
 export function resetGrounding() { groundingOff = false; }
@@ -460,6 +629,9 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/v1/ping") {
       return text(`SPIKE OK\t${env.AI || env.GEMINI_KEY ? "ai" : "no-ai"}\t${env.GEMINI_KEY ? "gemini" : "cloudflare"}\n`);
+    }
+    if (url.pathname === "/v1/mcp") {
+      try { return text(await mcpStatus(env)); } catch (e) { return text(`ERR\t${esc(e.message)}\n`); }
     }
     if (url.pathname === "/v1/gemini-check") {
       try { return text(await geminiCheck(env)); } catch (e) { return text(`Check failed: ${e.message}\n`); }
