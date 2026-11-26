@@ -24,6 +24,7 @@ AccessControlInfo:
   ReleaseKernelMinor            : "33"
   UseExtSaveData                : false
   FileSystemAccess:
+   - Debug
    - DirectSdmc
    - DirectSdmcWrite
   IdealProcessor                : 0
@@ -46,6 +47,10 @@ AccessControlInfo:
   CanAccessCore2                : true
   SystemMode                    : 64MB
   MemoryType                    : Application
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
   SystemCallAccess:
     ControlMemory: 1
     QueryMemory: 2
