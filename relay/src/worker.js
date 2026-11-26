@@ -273,52 +273,82 @@ async function runAI(env, messages) {
 // models answer 429 (paid only) on a free key.
 const GEMINI_MODELS = ["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"];
 
-export async function gemini(req, history, env, today, doFetch = fetch) {
+// Google Search inside Gemini is paid on some free keys; once it fails we do
+// our own web search instead (remembered while this worker stays warm).
+let groundingOff = false;
+
+export async function gemini(req, history, env, today, doFetch = fetch, lookup = webLookup) {
   const search = req.web || req.persona === "searcher";
-  let sys = systemPrompt(req, null, today);
-  if (search) sys += "\n\nYou can use Google Search. Search before answering anything about a specific product, brand, food or nutrition facts, game, person, place, price, score, release or news, or anything you aren't sure of. Base numbers on what you find. Don't write citation numbers; sources are shown under your answer." +
-    (req.persona === "searcher" ? " Always search, for every question." : "");
-  const body = {
-    systemInstruction: { parts: [{ text: sys }] },
-    contents: history.map((m) => ({
-      role: m.role === "user" ? "user" : "model",
-      parts: [...(m.images || []).map((i) => ({ inline_data: { mime_type: i.mime, data: i.data } })), { text: m.content || "." }],
-    })),
-    generationConfig: { maxOutputTokens: 2048, temperature: 0.5 },
-  };
-  if (search) body.tools = [{ google_search: {} }];
+  const contents = history.map((m) => ({
+    role: m.role === "user" ? "user" : "model",
+    parts: [...(m.images || []).map((i) => ({ inline_data: { mime_type: i.mime, data: i.data } })), { text: m.content || "." }],
+  }));
   const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
   const errs = [];
+
+  async function ask(m, sys, tools) {
+    const body = { systemInstruction: { parts: [{ text: sys }] }, contents, generationConfig: { maxOutputTokens: 2048, temperature: 0.5 } };
+    if (tools) body.tools = [{ google_search: {} }];
+    const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) return { status: res.status, err: `${m}: ${res.status} ${(j.error?.message || "").slice(0, 90)}`, msg: j.error?.message || "" };
+    const c = j.candidates && j.candidates[0];
+    const text = (c?.content?.parts || []).map((p) => p.text || "").join("");
+    if (!text.trim()) return { status: 0, err: `${m}: empty answer (${c?.finishReason || "?"})` };
+    const seen = new Set(), sources = [];
+    for (const g of c.groundingMetadata?.groundingChunks || []) {
+      const w = g.web;
+      if (!w || !w.uri || seen.has(w.title || w.uri)) continue;
+      seen.add(w.title || w.uri);
+      sources.push({ title: w.title || w.uri, link: w.uri });
+      if (sources.length >= 6) break;
+    }
+    return { text, sources };
+  }
+
+  // 1) Gemini with Google Search built in
+  if (search && !groundingOff) {
+    const sys = systemPrompt(req, null, today) +
+      "\n\nYou can use Google Search. Search before answering anything about a specific product, brand, food or nutrition facts, game, person, place, price, score, release or news, or anything you aren't sure of. Base numbers on what you find. Don't write citation numbers; sources are shown under your answer." +
+      (req.persona === "searcher" ? " Always search, for every question." : "");
+    try {
+      const r = await ask(models[0], sys, true);
+      if (r.text) return r;
+      errs.push(r.err);
+      if (r.status === 429 || r.status === 400) groundingOff = true;
+      if (r.status === 403 || /api key/i.test(r.msg || "")) throw new Error(r.err);
+    } catch (e) { if (!errs.length) errs.push(e.message); }
+  }
+
+  // 2) plain Gemini, with our own web search results in the instructions
+  let results = null;
+  if (search) {
+    const force = req.persona === "searcher";
+    let q = env.AI ? await planSearch(env, history, force).catch(() => "") : history[history.length - 1].content.slice(0, 150);
+    if (!q && force) q = history[history.length - 1].content.slice(0, 150);
+    if (q.trim()) {
+      results = await lookup(q).catch(() => []);
+      results.query = q;
+    }
+  }
+  const sys = systemPrompt(req, results, today);
   for (const m of models) {
     try {
-      const res = await doFetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_KEY },
-        body: JSON.stringify(body),
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        errs.push(`${m}: ${res.status} ${(j.error?.message || "").slice(0, 90)}`);
-        if (res.status === 403 || (res.status === 400 && /api key/i.test(j.error?.message || ""))) break;
-        continue;
-      }
-      const c = j.candidates && j.candidates[0];
-      const text = (c?.content?.parts || []).map((p) => p.text || "").join("");
-      if (!text.trim()) { errs.push(`${m}: empty answer (${c?.finishReason || "?"})`); continue; }
-      const seen = new Set(), sources = [];
-      for (const g of c.groundingMetadata?.groundingChunks || []) {
-        const w = g.web;
-        if (!w || !w.uri || seen.has(w.title || w.uri)) continue;
-        seen.add(w.title || w.uri);
-        sources.push({ title: w.title || w.uri, link: w.uri });
-        if (sources.length >= 6) break;
-      }
-      return { text, sources };
+      const r = await ask(m, sys, false);
+      if (r.text) return { text: r.text, sources: (results || []).map((x) => ({ title: x.title, link: x.link })) };
+      errs.push(r.err);
+      if (r.status === 403 || (r.status === 400 && /api key/i.test(r.msg || ""))) break;
     } catch (e) { errs.push(`${m}: ${e.message}`); }
   }
   // the first error is usually the telling one (later models are just fallbacks)
-  throw new Error(`Gemini didn't answer. ${errs.slice(0, 2).join(" | ")}`.slice(0, 230));
+  throw new Error(`Gemini didn't answer. ${errs.slice(-2).join(" | ")}`.slice(0, 230));
 }
+
+export function resetGrounding() { groundingOff = false; }
 
 // ---------- voice ----------
 

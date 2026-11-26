@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini } from "../src/worker.js";
+import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding } from "../src/worker.js";
 
 let passed = 0;
 async function test(name, fn) { try { await fn(); passed++; console.log("ok -", name); } catch (e) { console.log("FAIL -", name); console.log(e); process.exitCode = 1; } }
@@ -137,6 +137,29 @@ await test("gemini gets the photo", async () => {
   req.messages[0].content = "(photo)";
   await gemini(req, req.messages, { GEMINI_KEY: "k" }, "d", fakeFetch);
   assert.deepEqual(sent.contents[0].parts[0], { inline_data: { mime_type: "image/jpeg", data: "QUJD" } });
+});
+
+await test("google search quota: falls back to our own search", async () => {
+  resetGrounding();
+  const calls = [];
+  const fakeFetch = async (u, o) => {
+    const b = JSON.parse(o.body);
+    calls.push(!!b.tools);
+    if (b.tools) return new Response(JSON.stringify({ error: { message: "You exceeded your current quota" } }), { status: 429 });
+    assert.match(b.systemInstruction.parts[0].text, /Quest page text/);
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "18g" }] } }] }));
+  };
+  const lookup = async () => [{ title: "Quest", link: "https://quest", text: "", page: "Quest page text" }];
+  const env = { GEMINI_KEY: "k", AI: { run: async () => ({ response: "SEARCH: quest chips protein" }) } };
+  const g = await gemini({ persona: "chill", custom: "", project: "", web: true }, [{ role: "user", content: "quest chips protein?" }], env, "d", fakeFetch, lookup);
+  assert.equal(g.text, "18g");
+  assert.deepEqual(g.sources, [{ title: "Quest", link: "https://quest" }]);
+  assert.deepEqual(calls, [true, false]);
+  // next time it skips Google Search right away
+  calls.length = 0;
+  await gemini({ persona: "chill", custom: "", project: "", web: true }, [{ role: "user", content: "x" }], env, "d", fakeFetch, lookup);
+  assert.deepEqual(calls, [false]);
+  resetGrounding();
 });
 
 console.log(`${passed} tests passed`);
