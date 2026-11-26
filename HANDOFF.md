@@ -49,7 +49,7 @@ Spike AI is an AI assistant app for the Nintendo 3DS. It has two parts:
 - **Start-up log:** each start-up step prints on the top screen and is saved to `sdmc:/3ds/SpikeAI/boot.txt`.
 
 ## Open items
-1. **The real 3DS still hasn't fully confirmed it works.** After the RSF fix, the user saw the white-on-black start-up text, which means Spike's code now runs. Still unknown: does it reach the app, or freeze on a step? Ask for the last line on the top screen or the contents of `boot.txt`.
+1. **Spike still freezes on the real 3DS (CIA).** After the RSF fix, the user sees a black/white screen for about half a second (the start-up text), then the Homebrew logo screen, then it stays stuck. So the code runs and gets past the console steps, and probably hangs at or after the "graphics" step (C3D/C2D init, font, opening the last chat, or the first frame). Next step: get the contents of `sdmc:/3ds/SpikeAI/boot.txt` (last line = last step reached), then fix that step. Unknown whether the .3dsx via Homebrew Launcher behaves the same.
 2. **No banner in the CIA yet.** The original bannertool repo (Steveice10) is gone. Cloning the fork `diasurgical/bannertool` was blocked by the auto-mode safety check. The user hasn't answered yet; if they say "ok use diasurgical bannertool", try again. The fallback is writing a small banner generator ourselves.
 3. **Memory:** the user is turning on Claude memory in Settings.
 4. **Gemini free limits** reset at 3 AM Panama time; Cloudflare's reset at 7 PM Panama time.
