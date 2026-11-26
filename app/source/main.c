@@ -2215,26 +2215,48 @@ static void handle_keys(u32 down, u32 held)
 
 // ---------------------------------------------------------------- main
 
+static void boot_step(const char *what)
+{
+	printf("- %s\n", what);
+	gfxFlushBuffers();
+	gfxSwapBuffers();
+	gspWaitForVBlank();
+	FILE *f = fopen(BASE "/boot.txt", !strcmp(what, "SD card folders") ? "w" : "a");
+	if (f) { fprintf(f, "%s\n", what); fclose(f); }
+}
+
 int main(void)
 {
 	gfxInitDefault();
+	// Start-up steps are printed on the top screen (and saved to boot.txt), so
+	// if Spike ever freezes while starting, the last line says where.
+	consoleInit(GFX_TOP, NULL);
+	printf("Spike AI is starting...\n\n");
+	boot_step("SD card folders");
+	ensure_dirs();
+	boot_step("romfs");
 	romfsInit();
+	boot_step("settings");
+	cfg_load();
+	boot_step("chat list");
+	index_load();
+	boot_step("network");
+	net_init();
+	net_set_verify(cfg.verify);
+	boot_step("graphics");
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(8192);
 	C2D_Prepare();
 	C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 	C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+	boot_step("font");
 	gfx_init();
 	gfx_set_theme(true);
-
-	ensure_dirs();
-	cfg_load();
-	index_load();
-	net_init();
-	net_set_verify(cfg.verify);
+	boot_step("last chat");
 	if (cfg.last_chat && chat_find(cfg.last_chat)) open_chat(cfg.last_chat);
 	if (!cfg.relay[0]) { view = V_SETTINGS; sel[V_SETTINGS] = S_RELAY; }
 
+	boot_step("ready");
 	bool touching = false;
 	while (aptMainLoop()) {
 		hidScanInput();
