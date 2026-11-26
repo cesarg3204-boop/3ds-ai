@@ -469,7 +469,7 @@ async function geminiWithTools(req, contents, env, today, models, doFetch, errs)
   if (errors.length) errs.push(...errors);
   if (!tools.length) return null;
   const sys = systemPrompt(req, null, today) +
-    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them whenever the user asks for something they can do; the user doesn't need special commands, they just ask in normal words (e.g. "send me a WhatsApp saying hi" means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
+    "\n\nYou have tools from connected services (" + [...new Set(tools.map((t) => t.server))].join(", ") + "). Use them whenever the user asks for something they can do; the user doesn't need special commands, they just ask in normal words (e.g. asking to send yourself a WhatsApp means use the WhatsApp tool). Use web search/scraping for facts and Zapier for the user's apps. " +
     "Before any tool that sends, posts, buys, deletes or changes something (email, messages, calendar events, files), first tell the user exactly what you'll do and only do it after they say yes in their next message. Reading and searching don't need confirmation. Don't write citation numbers.";
   const decl = tools.map((t) => ({ name: t.fn, description: `[${t.server}] ${t.description}`, parametersJsonSchema: t.schema }));
   const convo = [...contents];
