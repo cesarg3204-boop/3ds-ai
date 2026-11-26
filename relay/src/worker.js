@@ -227,6 +227,10 @@ export function systemPrompt(req, results, today) {
   return parts.join("\n\n");
 }
 
+export function noCites(s) {
+  return String(s).replace(/ ?\[\d+(?:\s*[,-]\s*\d+)*\]/g, "").replace(/ +([.,;:!?])/g, "$1");
+}
+
 // Removes markdown and characters the 3DS font can't show (they appear as "?" boxes).
 export function plain(s) {
   return String(s)
@@ -647,7 +651,10 @@ export async function chat(body, env, today) {
   }
   for (const m of history) if (m.role === "user" && !m.content.trim() && m.images && m.images.length) m.content = PHOTO_ONLY;
   const hasPhoto = !!(lastMsg.images && lastMsg.images.length);
-  const out = (answer, sources) => ["OK", ...extra, `A\t${esc(answer)}`, ...sources.map((r) => `S\t${esc(r.title)}\t${esc(r.link)}`)].join("\n") + "\n";
+  // Only notes about something that didn't work are shown; source links and
+  // citation numbers like [1] are left out (the user doesn't want them).
+  const out = (answer, sources) => ["OK", ...extra.filter((l) => !l.startsWith("S\t")), `A\t${esc(noCites(answer))}`,
+    ...[...extra.filter((l) => l.startsWith("S\t")), ...sources.filter((r) => !r.link && !/^Used /.test(r.title)).map((r) => `S\t${esc(r.title)}\t`)]].join("\n") + "\n";
   if (env.GEMINI_KEY) {
     try {
       const g = await gemini(req, history, env, today);

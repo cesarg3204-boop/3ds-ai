@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding, rpcResult, mcpServers, mentioned } from "../src/worker.js";
+import worker, { parseRequest, esc, unesc, plain, parseRss, systemPrompt, chat, planSearch, pageText, answerText, gemini, resetGrounding, rpcResult, mcpServers, mentioned, noCites } from "../src/worker.js";
 
 let passed = 0;
 async function test(name, fn) { try { await fn(); passed++; console.log("ok -", name); } catch (e) { console.log("FAIL -", name); console.log(e); process.exitCode = 1; } }
@@ -244,6 +244,10 @@ await test("gemini out of free uses: cloudflare runs the @tool", async () => {
   assert.equal(g.text, "Sent you hello on WhatsApp.");
   assert.deepEqual(called[0], { name: "whatsapp_send", arguments: { instructions: "say hello" } });
   assert.equal(g.sources[0].title, "Used zapier: whatsapp_send");
+});
+
+await test("citation numbers are removed", () => {
+  assert.equal(noCites("It has 19g of protein [1]. Zapier works [2, 3]."), "It has 19g of protein. Zapier works.");
 });
 
 console.log(`${passed} tests passed`);
